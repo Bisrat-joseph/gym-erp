@@ -1,0 +1,9 @@
+.env
+server/bin/
+server/gympulse
+ui design inspiration images/
+node_modules/
+**/node_modules/
+.pnpm-store/
+.pgdata/
+.pnpm-store

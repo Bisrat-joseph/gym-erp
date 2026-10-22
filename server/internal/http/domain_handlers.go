@@ -1,0 +1,1518 @@
+package httpserver
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/csv"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"gympulse-server/internal/checkin"
+	"gympulse-server/internal/http/api"
+)
+
+func domainError(code string) api.ErrorEnvelope {
+	var e api.ErrorEnvelope
+	e.Error.Code = code
+	e.Error.Message = code
+	return e
+}
+func (a *apiImpl) signedFileMAC(fileID uuid.UUID, expires int64) string {
+	m := hmac.New(sha256.New, []byte(a.secret()))
+	_, _ = m.Write([]byte(fileID.String() + ":" + strconv.FormatInt(expires, 10)))
+	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+}
+func (a *apiImpl) domainGym(ctx context.Context, manager bool) (uuid.UUID, bool) {
+	if manager {
+		return a.authManager(ctx)
+	}
+	return a.authGym(ctx)
+}
+func (a *apiImpl) memberJSON(ctx context.Context, gym, id uuid.UUID) (api.JsonObject, error) {
+	m := api.JsonObject{}
+	var code, status string
+	var branch uuid.UUID
+	err := a.pool.QueryRow(ctx, `SELECT member_code,status,branch_id FROM members WHERE gym_id=$1 AND id=$2`, gym, id).Scan(&code, &status, &branch)
+	if err != nil {
+		return nil, err
+	}
+	m["id"], m["member_code"], m["status"], m["home_branch_id"] = id, code, status, branch
+	return m, nil
+}
+func (a *apiImpl) ListLeads(ctx context.Context, req api.ListLeadsRequestObject) (api.ListLeadsResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.ListLeads401JSONResponse(domainError("unauthorized")), nil
+	}
+	rows, err := a.pool.Query(ctx, `SELECT id,name,COALESCE(email,''),COALESCE(phone,''),status,source,created_at FROM leads WHERE gym_id=$1 ORDER BY created_at DESC LIMIT 100`, gym)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []api.JsonObject{}
+	for rows.Next() {
+		var id uuid.UUID
+		var n, e, p, s, src string
+		var t time.Time
+		if err := rows.Scan(&id, &n, &e, &p, &s, &src, &t); err != nil {
+			return nil, err
+		}
+		items = append(items, api.JsonObject{"id": id, "name": n, "email": e, "phone": p, "status": s, "source": src, "created_at": t})
+	}
+	return api.ListLeads200JSONResponse{Items: items}, nil
+}
+func (a *apiImpl) CreateLead(ctx context.Context, req api.CreateLeadRequestObject) (api.CreateLeadResponseObject, error) {
+	if req.Body == nil || (req.Body.Name == nil && req.Body.Email == nil && req.Body.Phone == nil) {
+		return api.CreateLead400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	gym, ok := a.authGym(ctx)
+	if !ok {
+		_ = a.pool.QueryRow(ctx, `SELECT id FROM gyms ORDER BY created_at LIMIT 1`).Scan(&gym)
+	}
+	n, e, p, msg := "", "", "", ""
+	if req.Body.Name != nil {
+		n = *req.Body.Name
+	}
+	if req.Body.Email != nil {
+		e = string(*req.Body.Email)
+	}
+	if req.Body.Phone != nil {
+		p = *req.Body.Phone
+	}
+	if req.Body.Message != nil {
+		msg = *req.Body.Message
+	}
+	if gym == uuid.Nil {
+		return api.CreateLead202Response{}, nil
+	}
+	_, err := a.pool.Exec(ctx, `INSERT INTO leads(id,gym_id,name,email,phone,message,source) VALUES($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,$7)`, newUUID(), gym, n, e, p, msg, "landing")
+	if err != nil {
+		return nil, err
+	}
+	return api.CreateLead202Response{}, nil
+}
+func (a *apiImpl) GetLead(ctx context.Context, req api.GetLeadRequestObject) (api.GetLeadResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.GetLead403JSONResponse(domainError("forbidden")), nil
+	}
+	m := api.JsonObject{}
+	var id uuid.UUID
+	var n, e, p, s string
+	err := a.pool.QueryRow(ctx, `SELECT id,name,COALESCE(email,''),COALESCE(phone,''),status FROM leads WHERE gym_id=$1 AND id=$2`, gym, uuid.UUID(req.LeadId)).Scan(&id, &n, &e, &p, &s)
+	if err != nil {
+		return api.GetLead404JSONResponse(domainError("not_found")), nil
+	}
+	m["id"], m["name"], m["email"], m["phone"], m["status"] = id, n, e, p, s
+	return api.GetLead200JSONResponse(m), nil
+}
+func (a *apiImpl) PatchLead(ctx context.Context, req api.PatchLeadRequestObject) (api.PatchLeadResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.PatchLead403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body == nil || req.Body.Status == nil {
+		return api.PatchLead400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	_, err := a.pool.Exec(ctx, `UPDATE leads SET status=$1,updated_at=now() WHERE gym_id=$2 AND id=$3`, string(*req.Body.Status), gym, uuid.UUID(req.LeadId))
+	if err != nil {
+		return nil, err
+	}
+	return api.PatchLead200JSONResponse{"id": req.LeadId, "status": *req.Body.Status}, nil
+}
+func (a *apiImpl) ConvertLead(ctx context.Context, req api.ConvertLeadRequestObject) (api.ConvertLeadResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok || req.Body == nil {
+		return api.ConvertLead403JSONResponse(domainError("forbidden")), nil
+	}
+	actor, hasActor := ctx.Value(authUserKey).(uuid.UUID)
+	if !hasActor {
+		return api.ConvertLead403JSONResponse(domainError("forbidden")), nil
+	}
+	id := newUUID()
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, `INSERT INTO members(id,gym_id,branch_id,user_id,member_code,status) VALUES($1,$2,$3,$4,$5,'active')`, id, gym, uuid.UUID(req.Body.HomeBranchId), actor, id.String())
+	if err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE leads SET status='converted',converted_member_id=$1,updated_at=now() WHERE gym_id=$2 AND id=$3`, id, gym, uuid.UUID(req.LeadId))
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return api.ConvertLead201JSONResponse{"id": id}, nil
+}
+func (a *apiImpl) CreateLeadNote(ctx context.Context, req api.CreateLeadNoteRequestObject) (api.CreateLeadNoteResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.CreateLeadNote403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body == nil {
+		return api.CreateLeadNote400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	actor, _ := ctx.Value(authUserKey).(uuid.UUID)
+	id := newUUID()
+	_, err := a.pool.Exec(ctx, `INSERT INTO lead_notes(id,lead_id,gym_id,author_user_id,note) VALUES($1,$2,$3,$4,$5)`, id, uuid.UUID(req.LeadId), gym, actor, req.Body.Body)
+	if err != nil {
+		return nil, err
+	}
+	return api.CreateLeadNote201JSONResponse{"id": id}, nil
+}
+
+func (a *apiImpl) ListMembers(ctx context.Context, req api.ListMembersRequestObject) (api.ListMembersResponseObject, error) {
+	gym, ok := a.domainGym(ctx, false)
+	if !ok {
+		return api.ListMembers401JSONResponse(domainError("unauthorized")), nil
+	}
+	rows, err := a.pool.Query(ctx, `SELECT m.id,m.member_code,m.status,COALESCE(u.name,''),COALESCE(u.email,''),m.branch_id,m.created_at
+		FROM members m JOIN users u ON u.id=m.user_id
+		WHERE m.gym_id=$1 ORDER BY m.created_at DESC LIMIT 100`, gym)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []api.JsonObject{}
+	for rows.Next() {
+		var id, branch uuid.UUID
+		var c, s, name, email string
+		var created time.Time
+		if err := rows.Scan(&id, &c, &s, &name, &email, &branch, &created); err != nil {
+			return nil, err
+		}
+		items = append(items, api.JsonObject{
+			"id": id, "member_code": c, "status": s, "name": name, "email": email,
+			"branch_id": branch, "created_at": created,
+		})
+	}
+	return api.ListMembers200JSONResponse{Items: items}, nil
+}
+func (a *apiImpl) CreateMember(ctx context.Context, req api.CreateMemberRequestObject) (api.CreateMemberResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.CreateMember403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body == nil {
+		return api.CreateMember400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	userID, hasUser := ctx.Value(authUserKey).(uuid.UUID)
+	if req.Body.ExistingUserId != nil {
+		userID = uuid.UUID(*req.Body.ExistingUserId)
+		hasUser = true
+	}
+	if !hasUser {
+		return api.CreateMember400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	id := newUUID()
+	code := id.String()
+	if req.Body.MemberCode != nil {
+		code = *req.Body.MemberCode
+	}
+	_, err := a.pool.Exec(ctx, `INSERT INTO members(id,gym_id,branch_id,user_id,member_code,status,emergency_contact_name,emergency_contact_phone,photo_file_id) VALUES($1,$2,$3,$4,$5,'active',NULLIF($6,''),NULLIF($7,''),$8)`, id, gym, uuid.UUID(req.Body.HomeBranchId), userID, code, ptrString(req.Body.EmergencyContactName), ptrString(req.Body.EmergencyContactPhone), ptrUUID(req.Body.PhotoFileId))
+	if err != nil {
+		return nil, err
+	}
+	return api.CreateMember201JSONResponse{"id": id, "member_code": code, "status": "active"}, nil
+}
+func ptrString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+func ptrUUID(v any) any { return v }
+func (a *apiImpl) ExportMembers(ctx context.Context, req api.ExportMembersRequestObject) (api.ExportMembersResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.ExportMembers403JSONResponse(domainError("forbidden")), nil
+	}
+	rows, err := a.pool.Query(ctx, `SELECT id,member_code,status FROM members WHERE gym_id=$1 ORDER BY member_code`, gym)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	pr, pw := io.Pipe()
+	go func() {
+		w := csv.NewWriter(pw)
+		_ = w.Write([]string{"id", "member_code", "status"})
+		for rows.Next() {
+			var id uuid.UUID
+			var c, s string
+			_ = rows.Scan(&id, &c, &s)
+			_ = w.Write([]string{id.String(), c, s})
+		}
+		w.Flush()
+		_ = pw.Close()
+	}()
+	return api.ExportMembers200TextcsvResponse{Body: pr}, nil
+}
+func (a *apiImpl) ImportMembers(ctx context.Context, req api.ImportMembersRequestObject) (api.ImportMembersResponseObject, error) {
+	if _, ok := a.domainGym(ctx, true); !ok {
+		return api.ImportMembers403JSONResponse(domainError("forbidden")), nil
+	}
+	return api.ImportMembers200JSONResponse{"imported": 0, "dry_run": req.Params.DryRun != nil && *req.Params.DryRun}, nil
+}
+func (a *apiImpl) GetMember(ctx context.Context, req api.GetMemberRequestObject) (api.GetMemberResponseObject, error) {
+	gym, ok := a.domainGym(ctx, false)
+	if !ok {
+		return api.GetMember403JSONResponse(domainError("forbidden")), nil
+	}
+	m, err := a.memberJSON(ctx, gym, uuid.UUID(req.MemberId))
+	if err != nil {
+		return api.GetMember404JSONResponse(domainError("not_found")), nil
+	}
+	return api.GetMember200JSONResponse(m), nil
+}
+func (a *apiImpl) PatchMember(ctx context.Context, req api.PatchMemberRequestObject) (api.PatchMemberResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.PatchMember403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body == nil {
+		return api.PatchMember400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	if req.Body.HomeBranchId != nil {
+		_, _ = a.pool.Exec(ctx, `UPDATE members SET branch_id=$1,updated_at=now() WHERE gym_id=$2 AND id=$3`, uuid.UUID(*req.Body.HomeBranchId), gym, uuid.UUID(req.MemberId))
+	}
+	m, _ := a.memberJSON(ctx, gym, uuid.UUID(req.MemberId))
+	return api.PatchMember200JSONResponse(m), nil
+}
+func (a *apiImpl) ArchiveMember(ctx context.Context, req api.ArchiveMemberRequestObject) (api.ArchiveMemberResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.ArchiveMember403JSONResponse(domainError("forbidden")), nil
+	}
+	_, err := a.pool.Exec(ctx, `UPDATE members SET status='archived',archived_at=now(),updated_at=now() WHERE gym_id=$1 AND id=$2`, gym, uuid.UUID(req.MemberId))
+	if err != nil {
+		return nil, err
+	}
+	return api.ArchiveMember200JSONResponse{"id": req.MemberId, "status": "archived"}, nil
+}
+func (a *apiImpl) ListMemberMemberships(ctx context.Context, req api.ListMemberMembershipsRequestObject) (api.ListMemberMembershipsResponseObject, error) {
+	gym, ok := a.domainGym(ctx, false)
+	if !ok {
+		return api.ListMemberMemberships403JSONResponse(domainError("forbidden")), nil
+	}
+	rows, err := a.pool.Query(ctx, `SELECT id,plan_id,status,starts_at,ends_at FROM memberships WHERE gym_id=$1 AND member_id=$2 ORDER BY starts_at DESC`, gym, uuid.UUID(req.MemberId))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []api.JsonObject{}
+	for rows.Next() {
+		var id, p uuid.UUID
+		var s string
+		var st, en time.Time
+		if rows.Scan(&id, &p, &s, &st, &en) == nil {
+			items = append(items, api.JsonObject{"id": id, "plan_id": p, "status": s, "starts_at": st, "ends_at": en})
+		}
+	}
+	return api.ListMemberMemberships200JSONResponse{"items": items}, nil
+}
+func (a *apiImpl) AssignMembership(ctx context.Context, req api.AssignMembershipRequestObject) (api.AssignMembershipResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.AssignMembership403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body == nil {
+		return api.AssignMembership400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	id := newUUID()
+	start := req.Body.StartDate.Time
+	end := start.AddDate(0, 1, 0)
+	_, err := a.pool.Exec(ctx, `INSERT INTO memberships(id,gym_id,member_id,plan_id,starts_at,ends_at,status,created_by) VALUES($1,$2,$3,$4,$5,$6,'active',$7)`, id, gym, uuid.UUID(req.MemberId), uuid.UUID(req.Body.PlanId), start, end, ctx.Value(authUserKey))
+	if err != nil {
+		return nil, err
+	}
+	return api.AssignMembership201JSONResponse{"id": id, "status": "active"}, nil
+}
+func (a *apiImpl) ListMemberNotes(ctx context.Context, req api.ListMemberNotesRequestObject) (api.ListMemberNotesResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.ListMemberNotes403JSONResponse(domainError("forbidden")), nil
+	}
+	rows, err := a.pool.Query(ctx, `SELECT id,note,created_at FROM member_notes WHERE gym_id=$1 AND member_id=$2 ORDER BY created_at DESC`, gym, uuid.UUID(req.MemberId))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []api.JsonObject{}
+	for rows.Next() {
+		var id uuid.UUID
+		var n string
+		var t time.Time
+		if rows.Scan(&id, &n, &t) == nil {
+			items = append(items, api.JsonObject{"id": id, "body": n, "created_at": t})
+		}
+	}
+	return api.ListMemberNotes200JSONResponse{Items: items}, nil
+}
+func (a *apiImpl) CreateMemberNote(ctx context.Context, req api.CreateMemberNoteRequestObject) (api.CreateMemberNoteResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.CreateMemberNote403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body == nil {
+		return api.CreateMemberNote400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	id := newUUID()
+	actor, _ := ctx.Value(authUserKey).(uuid.UUID)
+	_, err := a.pool.Exec(ctx, `INSERT INTO member_notes(id,gym_id,member_id,author_user_id,note) VALUES($1,$2,$3,$4,$5)`, id, gym, uuid.UUID(req.MemberId), actor, req.Body.Body)
+	if err != nil {
+		return nil, err
+	}
+	return api.CreateMemberNote201JSONResponse{"id": id}, nil
+}
+func (a *apiImpl) RestoreMember(ctx context.Context, req api.RestoreMemberRequestObject) (api.RestoreMemberResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.RestoreMember403JSONResponse(domainError("forbidden")), nil
+	}
+	_, err := a.pool.Exec(ctx, `UPDATE members SET status='active',archived_at=NULL,updated_at=now() WHERE gym_id=$1 AND id=$2`, gym, uuid.UUID(req.MemberId))
+	if err != nil {
+		return nil, err
+	}
+	return api.RestoreMember200JSONResponse{"id": req.MemberId, "status": "active"}, nil
+}
+func (a *apiImpl) ListExpiringMemberships(ctx context.Context, req api.ListExpiringMembershipsRequestObject) (api.ListExpiringMembershipsResponseObject, error) {
+	if _, ok := a.domainGym(ctx, true); !ok {
+		return api.ListExpiringMemberships403JSONResponse(domainError("forbidden")), nil
+	}
+	return api.ListExpiringMemberships200JSONResponse{Items: []api.JsonObject{}}, nil
+}
+func (a *apiImpl) membershipAction(ctx context.Context, id uuid.UUID, status string) (api.JsonObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return nil, errors.New("forbidden")
+	}
+	_, err := a.pool.Exec(ctx, `UPDATE memberships SET status=$1,updated_at=now() WHERE gym_id=$2 AND id=$3`, status, gym, id)
+	return api.JsonObject{"id": id, "status": status}, err
+}
+func (a *apiImpl) CancelMembership(ctx context.Context, req api.CancelMembershipRequestObject) (api.CancelMembershipResponseObject, error) {
+	m, e := a.membershipAction(ctx, uuid.UUID(req.MembershipId), "cancelled")
+	if e != nil {
+		return api.CancelMembership403JSONResponse(domainError("forbidden")), nil
+	}
+	return api.CancelMembership200JSONResponse(m), nil
+}
+func (a *apiImpl) FreezeMembership(ctx context.Context, req api.FreezeMembershipRequestObject) (api.FreezeMembershipResponseObject, error) {
+	m, e := a.membershipAction(ctx, uuid.UUID(req.MembershipId), "frozen")
+	if e != nil {
+		return api.FreezeMembership403JSONResponse(domainError("forbidden")), nil
+	}
+	return api.FreezeMembership200JSONResponse(m), nil
+}
+func (a *apiImpl) RenewMembership(ctx context.Context, req api.RenewMembershipRequestObject) (api.RenewMembershipResponseObject, error) {
+	m, e := a.membershipAction(ctx, uuid.UUID(req.MembershipId), "active")
+	if e != nil {
+		return api.RenewMembership403JSONResponse(domainError("forbidden")), nil
+	}
+	return api.RenewMembership200JSONResponse(m), nil
+}
+func (a *apiImpl) ResumeMembership(ctx context.Context, req api.ResumeMembershipRequestObject) (api.ResumeMembershipResponseObject, error) {
+	m, e := a.membershipAction(ctx, uuid.UUID(req.MembershipId), "active")
+	if e != nil {
+		return api.ResumeMembership403JSONResponse(domainError("forbidden")), nil
+	}
+	return api.ResumeMembership200JSONResponse(m), nil
+}
+func (a *apiImpl) UpgradeMembership(ctx context.Context, req api.UpgradeMembershipRequestObject) (api.UpgradeMembershipResponseObject, error) {
+	m, e := a.membershipAction(ctx, uuid.UUID(req.MembershipId), "active")
+	if e != nil {
+		return api.UpgradeMembership403JSONResponse(domainError("forbidden")), nil
+	}
+	return api.UpgradeMembership200JSONResponse(m), nil
+}
+func (a *apiImpl) ListPlans(ctx context.Context, req api.ListPlansRequestObject) (api.ListPlansResponseObject, error) {
+	gym, ok := a.domainGym(ctx, false)
+	if !ok {
+		return api.ListPlans403JSONResponse(domainError("forbidden")), nil
+	}
+	rows, err := a.pool.Query(ctx, `SELECT id,name,price_minor,currency,period_unit,period_count FROM membership_plans WHERE gym_id=$1 AND archived_at IS NULL ORDER BY name`, gym)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []api.JsonObject{}
+	for rows.Next() {
+		var id uuid.UUID
+		var n, c, u string
+		var price int64
+		var count int
+		if rows.Scan(&id, &n, &price, &c, &u, &count) == nil {
+			items = append(items, api.JsonObject{"id": id, "name": n, "price_minor": price, "currency": c, "period_unit": u, "period_count": count})
+		}
+	}
+	return api.ListPlans200JSONResponse{"items": items}, nil
+}
+func (a *apiImpl) CreatePlan(ctx context.Context, req api.CreatePlanRequestObject) (api.CreatePlanResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.CreatePlan403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body == nil {
+		return api.CreatePlan400JSONResponse{ErrorJSONResponse: api.ErrorJSONResponse{}}, nil
+	}
+	id := newUUID()
+	_, err := a.pool.Exec(ctx, `INSERT INTO membership_plans(id,gym_id,name,description,price_minor,currency,period_unit,period_count) VALUES($1,$2,$3,$4,$5,'USD',$6,$7)`, id, gym, req.Body.Name, ptrString(req.Body.Description), req.Body.PriceMinor, string(req.Body.DurationUnit), req.Body.DurationCount)
+	if err != nil {
+		return nil, err
+	}
+	return api.CreatePlan201JSONResponse{"id": id, "name": req.Body.Name}, nil
+}
+func (a *apiImpl) GetPlan(ctx context.Context, req api.GetPlanRequestObject) (api.GetPlanResponseObject, error) {
+	gym, ok := a.domainGym(ctx, false)
+	if !ok {
+		return api.GetPlan403JSONResponse(domainError("forbidden")), nil
+	}
+	var n, c, u string
+	var price int64
+	var count int
+	err := a.pool.QueryRow(ctx, `SELECT name,currency,period_unit,price_minor,period_count FROM membership_plans WHERE gym_id=$1 AND id=$2`, gym, uuid.UUID(req.PlanId)).Scan(&n, &c, &u, &price, &count)
+	if err != nil {
+		return api.GetPlan404JSONResponse(domainError("not_found")), nil
+	}
+	return api.GetPlan200JSONResponse{"id": req.PlanId, "name": n, "currency": c, "period_unit": u, "price_minor": price, "period_count": count}, nil
+}
+func (a *apiImpl) PatchPlan(ctx context.Context, req api.PatchPlanRequestObject) (api.PatchPlanResponseObject, error) {
+	gym, ok := a.domainGym(ctx, true)
+	if !ok {
+		return api.PatchPlan403JSONResponse(domainError("forbidden")), nil
+	}
+	if req.Body != nil && req.Body.Name != nil {
+		_, _ = a.pool.Exec(ctx, `UPDATE membership_plans SET name=$1,updated_at=now() WHERE gym_id=$2 AND id=$3`, *req.Body.Name, gym, uuid.UUID(req.PlanId))
+	}
+	return api.PatchPlan200JSONResponse{"id": req.PlanId}, nil
+}
+
+// Keep the generated handler surface honest when the OpenAPI generator has not
+// yet emitted wrappers for the newer domain groups. These routes still enforce
+// authentication and return a stable JSON contract rather than a generated 501.
+// domainFallback serves the domain endpoints which are newer than the checked-in
+// generated contract. It deliberately keeps authorization and tenant scoping in
+// the server, while accepting the loose JsonObject shapes used by the API.
+func (a *apiImpl) domainFallback(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(strings.Trim(r.URL.Path, "/"), "v1/public/") {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) == 3 && parts[2] == "gym" && r.Method == http.MethodGet {
+			var id uuid.UUID
+			var name, timezone, currency string
+			err := a.pool.QueryRow(r.Context(), `SELECT id,name,timezone,currency FROM gyms ORDER BY created_at LIMIT 1`).Scan(&id, &name, &timezone, &currency)
+			if err != nil {
+				writeError(w, http.StatusNotFound, "not_found", "public gym is not configured", nil)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "name": name, "timezone": timezone, "currency": currency})
+			return
+		}
+		writeError(w, http.StatusNotFound, "not_found", "public endpoint not found", nil)
+		return
+	}
+	gym, ok := a.authGym(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required", nil)
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 2 {
+		writeError(w, http.StatusNotFound, "not_found", "endpoint not found", nil)
+		return
+	}
+	writeJSON := func(status int, value any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(value)
+	}
+	decode := func() map[string]any {
+		var v map[string]any
+		_ = json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&v)
+		return v
+	}
+	actor, _ := r.Context().Value(authUserKey).(uuid.UUID)
+
+	switch {
+	case parts[1] == "invoices" && len(parts) == 4 && parts[3] == "void" && r.Method == http.MethodPost:
+		invoiceID, _ := uuid.Parse(parts[2])
+		tag, err := a.pool.Exec(r.Context(), `UPDATE invoices SET status='void' WHERE gym_id=$1 AND id=$2 AND status NOT IN ('paid','void')`, gym, invoiceID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invoice_void_failed", err.Error(), nil)
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			writeError(w, http.StatusConflict, "invoice_not_voidable", "invoice is paid, void, or not found", nil)
+			return
+		}
+		writeJSON(http.StatusOK, map[string]any{"id": invoiceID, "status": "void"})
+		return
+
+	case parts[1] == "invoices" && len(parts) == 4 && parts[3] == "discount" && r.Method == http.MethodPost:
+		invoiceID, _ := uuid.Parse(parts[2])
+		body := decode()
+		discount, _ := strconv.ParseInt(stringValue(body["amount_minor"]), 10, 64)
+		if discount <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_discount", "amount_minor must be positive", nil)
+			return
+		}
+		tx, err := a.pool.Begin(r.Context())
+		if err != nil {
+			writeError(w, 500, "transaction_failed", err.Error(), nil)
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		var total, paid int64
+		var status string
+		if err = tx.QueryRow(r.Context(), `SELECT total_minor,paid_minor,status FROM invoices WHERE gym_id=$1 AND id=$2 FOR UPDATE`, gym, invoiceID).Scan(&total, &paid, &status); err != nil {
+			writeError(w, 404, "not_found", "invoice not found", nil)
+			return
+		}
+		if status == "paid" || status == "void" || discount >= total-paid {
+			writeError(w, 409, "invoice_not_discountable", "invoice cannot accept this discount", nil)
+			return
+		}
+		_, err = tx.Exec(r.Context(), `INSERT INTO invoice_adjustments(id,gym_id,invoice_id,kind,amount_minor,reason,created_by) VALUES($1,$2,$3,'discount',$4,$5,$6)`, newUUID(), gym, invoiceID, discount, stringValue(body["reason"]), actor)
+		if err == nil {
+			_, err = tx.Exec(r.Context(), `UPDATE invoices SET total_minor=total_minor-$1,status=CASE WHEN paid_minor>=total_minor-$1 THEN 'paid' WHEN paid_minor>0 THEN 'partial' ELSE status END WHERE id=$2 AND gym_id=$3`, discount, invoiceID, gym)
+		}
+		if err == nil {
+			err = tx.Commit(r.Context())
+		}
+		if err != nil {
+			writeError(w, 400, "discount_failed", err.Error(), nil)
+			return
+		}
+		writeJSON(http.StatusOK, map[string]any{"id": invoiceID, "discount_minor": discount})
+		return
+
+	case parts[1] == "payments" && len(parts) == 4 && parts[3] == "refund" && r.Method == http.MethodPost:
+		paymentID, _ := uuid.Parse(parts[2])
+		body := decode()
+		amount, _ := strconv.ParseInt(stringValue(body["amount_minor"]), 10, 64)
+		if amount <= 0 {
+			writeError(w, 400, "invalid_refund", "amount_minor must be positive", nil)
+			return
+		}
+		tx, err := a.pool.Begin(r.Context())
+		if err != nil {
+			writeError(w, 500, "transaction_failed", err.Error(), nil)
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		var invoiceID uuid.UUID
+		var original, refunded int64
+		if err = tx.QueryRow(r.Context(), `SELECT invoice_id,amount_minor FROM payments WHERE gym_id=$1 AND id=$2 FOR UPDATE`, gym, paymentID).Scan(&invoiceID, &original); err != nil {
+			writeError(w, 404, "not_found", "payment not found", nil)
+			return
+		}
+		_ = tx.QueryRow(r.Context(), `SELECT COALESCE(sum(amount_minor),0) FROM payment_refunds WHERE gym_id=$1 AND payment_id=$2`, gym, paymentID).Scan(&refunded)
+		if amount > original-refunded {
+			writeError(w, 409, "refund_exceeds_payment", "refund exceeds remaining payment", nil)
+			return
+		}
+		id := newUUID()
+		_, err = tx.Exec(r.Context(), `INSERT INTO payment_refunds(id,gym_id,payment_id,amount_minor,reason,idempotency_key,created_by) VALUES($1,$2,$3,$4,$5,NULLIF($6,''),$7) ON CONFLICT (gym_id,idempotency_key) DO NOTHING`, id, gym, paymentID, amount, stringValue(body["reason"]), r.Header.Get("Idempotency-Key"), actor)
+		if err == nil {
+			_, err = tx.Exec(r.Context(), `UPDATE invoices SET paid_minor=GREATEST(0,paid_minor-$1),status=CASE WHEN GREATEST(0,paid_minor-$1)=0 THEN 'unpaid' ELSE 'partial' END WHERE id=$2 AND gym_id=$3`, amount, invoiceID, gym)
+		}
+		if err == nil {
+			err = tx.Commit(r.Context())
+		}
+		if err != nil {
+			writeError(w, 400, "refund_failed", err.Error(), nil)
+			return
+		}
+		writeJSON(http.StatusCreated, map[string]any{"id": id, "payment_id": paymentID, "amount_minor": amount})
+		return
+
+	case parts[1] == "invoices" && len(parts) == 4 && parts[3] == "receipt" && r.Method == http.MethodGet:
+		invoiceID, _ := uuid.Parse(parts[2])
+		var paymentID uuid.UUID
+		var amount int64
+		var method string
+		var paidAt time.Time
+		if err := a.pool.QueryRow(r.Context(), `SELECT id,amount_minor,method,paid_at FROM payments WHERE gym_id=$1 AND invoice_id=$2 AND status='approved' ORDER BY paid_at DESC LIMIT 1`, gym, invoiceID).Scan(&paymentID, &amount, &method, &paidAt); err != nil {
+			writeError(w, 404, "not_found", "receipt not found", nil)
+			return
+		}
+		writeJSON(http.StatusOK, map[string]any{"payment_id": paymentID, "amount_minor": amount, "method": method, "paid_at": paidAt})
+		return
+
+	case parts[1] == "billing" && len(parts) == 3 && parts[2] == "overdue" && r.Method == http.MethodGet:
+		rows, err := a.pool.Query(r.Context(), `SELECT i.id,i.member_id,COALESCE(u.name,''),i.invoice_number,i.total_minor,i.paid_minor,i.due_at
+			FROM invoices i JOIN members m ON m.id=i.member_id JOIN users u ON u.id=m.user_id
+			WHERE i.gym_id=$1 AND i.status IN ('unpaid','partial') AND i.due_at<now() ORDER BY i.due_at`, gym)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, m uuid.UUID
+			var name, num string
+			var total, paid int64
+			var due time.Time
+			if rows.Scan(&id, &m, &name, &num, &total, &paid, &due) == nil {
+				items = append(items, map[string]any{
+					"id": id, "member_id": m, "member_name": name, "invoice_number": num,
+					"total_minor": total, "paid_minor": paid, "balance_minor": total - paid, "due_at": due,
+				})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "billing" && len(parts) == 3 && parts[2] == "cash-up" && r.Method == http.MethodGet:
+		rows, err := a.pool.Query(r.Context(), `SELECT method,COALESCE(sum(amount_minor),0) FROM payments WHERE gym_id=$1 AND status='approved' AND paid_at::date=COALESCE(NULLIF($2,'')::date,CURRENT_DATE) GROUP BY method ORDER BY method`, gym, r.URL.Query().Get("date"))
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var method string
+			var total int64
+			if rows.Scan(&method, &total) == nil {
+				items = append(items, map[string]any{"method": method, "total_minor": total})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "me" && len(parts) == 3 && parts[2] == "checkin-token" && r.Method == http.MethodGet:
+		var memberID uuid.UUID
+		var code string
+		if err := a.pool.QueryRow(r.Context(), `SELECT id,member_code FROM members WHERE gym_id=$1 AND user_id=$2 AND status='active' LIMIT 1`, gym, actor).Scan(&memberID, &code); err != nil {
+			writeError(w, http.StatusForbidden, "membership_required", "no active member profile", nil)
+			return
+		}
+		var active int
+		_ = a.pool.QueryRow(r.Context(), `SELECT count(*) FROM memberships WHERE gym_id=$1 AND member_id=$2 AND status IN ('active','trial') AND starts_at<=now() AND ends_at>=now()`, gym, memberID).Scan(&active)
+		if active == 0 {
+			writeError(w, http.StatusForbidden, "membership_required", "membership does not grant access", nil)
+			return
+		}
+		token, err := checkin.Sign(checkin.Claims{MemberID: memberID, GymID: gym, ExpiresAt: time.Now().Add(time.Minute).Unix()}, a.secret())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "token_error", err.Error(), nil)
+			return
+		}
+		writeJSON(http.StatusOK, map[string]any{"token": token, "member_code": code, "expires_at": time.Now().Add(time.Minute)})
+		return
+
+	case parts[1] == "checkins" && r.Method == http.MethodPost && (len(parts) == 2 || (len(parts) == 3 && parts[2] == "staff")):
+		body := decode()
+		memberID, _ := uuid.Parse(stringValue(body["member_id"]))
+		method := "staff"
+		if len(parts) == 2 {
+			method = "qr"
+		}
+		if token := stringValue(body["token"]); token != "" {
+			c, err := checkin.Verify(token, a.secret(), time.Now())
+			if err != nil || c.GymID != gym {
+				writeError(w, http.StatusForbidden, "invalid_checkin_token", "token is invalid or expired", nil)
+				return
+			}
+			memberID = c.MemberID
+		}
+		if memberID == uuid.Nil {
+			writeError(w, http.StatusBadRequest, "member_required", "member_id or token is required", nil)
+			return
+		}
+		branchID, _ := uuid.Parse(stringValue(body["branch_id"]))
+		if branchID == uuid.Nil {
+			_ = a.pool.QueryRow(r.Context(), `SELECT branch_id FROM members WHERE id=$1 AND gym_id=$2`, memberID, gym).Scan(&branchID)
+		}
+		id := newUUID()
+		idem := r.Header.Get("Idempotency-Key")
+		_, err := a.pool.Exec(r.Context(), `INSERT INTO attendance_events(id,gym_id,branch_id,member_id,method,idempotency_key) VALUES($1,$2,$3,$4,$5,NULLIF($6,'')) ON CONFLICT (gym_id,idempotency_key) DO NOTHING`, id, gym, branchID, memberID, method, idem)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "checkin_failed", err.Error(), nil)
+			return
+		}
+		writeJSON(http.StatusCreated, map[string]any{"id": id, "member_id": memberID, "branch_id": branchID, "method": method, "checked_in_at": time.Now()})
+		return
+
+	case parts[1] == "checkins" && r.Method == http.MethodGet && len(parts) == 2:
+		rows, err := a.pool.Query(r.Context(), `SELECT a.id,a.member_id,COALESCE(u.name,''),COALESCE(m.member_code,''),a.branch_id,COALESCE(b.name,''),a.method,a.checked_in_at
+			FROM attendance_events a
+			JOIN members m ON m.id=a.member_id
+			JOIN users u ON u.id=m.user_id
+			LEFT JOIN branches b ON b.id=a.branch_id
+			WHERE a.gym_id=$1 AND a.voided_at IS NULL ORDER BY a.checked_in_at DESC LIMIT 200`, gym)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, member, branch uuid.UUID
+			var name, code, branchName, method string
+			var at time.Time
+			if rows.Scan(&id, &member, &name, &code, &branch, &branchName, &method, &at) == nil {
+				items = append(items, map[string]any{
+					"id": id, "member_id": member, "member_name": name, "member_code": code,
+					"branch_id": branch, "branch_name": branchName, "method": method, "checked_in_at": at,
+				})
+			}
+		}
+		writeJSON(http.StatusOK, map[string]any{"items": items})
+		return
+
+	case parts[1] == "checkins" && len(parts) == 3 && parts[2] == "present" && r.Method == http.MethodGet:
+		rows, err := a.pool.Query(r.Context(), `SELECT DISTINCT ON (a.member_id) a.id,a.member_id,COALESCE(u.name,''),a.branch_id,a.checked_in_at
+			FROM attendance_events a
+			JOIN members m ON m.id=a.member_id
+			JOIN users u ON u.id=m.user_id
+			WHERE a.gym_id=$1 AND a.voided_at IS NULL AND a.checked_in_at > now()-interval '12 hours'
+			ORDER BY a.member_id,a.checked_in_at DESC`, gym)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, m, b uuid.UUID
+			var name string
+			var at time.Time
+			if rows.Scan(&id, &m, &name, &b, &at) == nil {
+				items = append(items, map[string]any{"id": id, "member_id": m, "member_name": name, "name": name, "branch_id": b, "checked_in_at": at})
+			}
+		}
+		writeJSON(http.StatusOK, map[string]any{"items": items})
+		return
+
+	case parts[1] == "payments" && r.Method == http.MethodGet && len(parts) == 2:
+		statusFilter := r.URL.Query().Get("status")
+		q := `SELECT p.id,p.invoice_id,p.member_id,COALESCE(u.name,''),p.amount_minor,p.method,COALESCE(p.provider,''),p.status,p.evidence_file_id,p.paid_at,COALESCE(p.reference,''),COALESCE(p.rejection_reason,'')
+			FROM payments p JOIN members m ON m.id=p.member_id JOIN users u ON u.id=m.user_id
+			WHERE p.gym_id=$1`
+		args := []any{gym}
+		if statusFilter != "" {
+			args = append(args, statusFilter)
+			q += fmt.Sprintf(` AND p.status=$%d`, len(args))
+		}
+		if mid := r.URL.Query().Get("member_id"); mid != "" {
+			id, _ := uuid.Parse(mid)
+			args = append(args, id)
+			q += fmt.Sprintf(` AND p.member_id=$%d`, len(args))
+		}
+		q += ` ORDER BY p.paid_at DESC LIMIT 200`
+		rows, err := a.pool.Query(r.Context(), q, args...)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, inv, mem uuid.UUID
+			var name, method, provider, status, ref, reason string
+			var amount int64
+			var evidence *uuid.UUID
+			var paidAt time.Time
+			if rows.Scan(&id, &inv, &mem, &name, &amount, &method, &provider, &status, &evidence, &paidAt, &ref, &reason) == nil {
+				items = append(items, map[string]any{
+					"id": id, "invoice_id": inv, "member_id": mem, "member_name": name,
+					"amount_minor": amount, "method": method, "provider": provider, "status": status,
+					"evidence_file_id": evidence, "paid_at": paidAt, "reference": ref, "rejection_reason": reason,
+				})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "payments" && r.Method == http.MethodPost && len(parts) == 2:
+		body := decode()
+		invoice, _ := uuid.Parse(stringValue(body["invoice_id"]))
+		member, _ := uuid.Parse(stringValue(body["member_id"]))
+		amount, _ := strconv.ParseInt(stringValue(body["amount_minor"]), 10, 64)
+		method := normalizePayMethod(stringValue(body["method"]))
+		if method == "" {
+			method = "cash"
+		}
+		provider := stringValue(body["provider"])
+		status := "approved"
+		if stringValue(body["evidence_file_id"]) != "" {
+			status = "pending"
+		}
+		if amount <= 0 || invoice == uuid.Nil || member == uuid.Nil {
+			writeError(w, http.StatusBadRequest, "invalid_payment", "invoice_id, member_id, and amount_minor are required", nil)
+			return
+		}
+		id := newUUID()
+		evidence, _ := uuid.Parse(stringValue(body["evidence_file_id"]))
+		var evidenceArg any
+		if evidence != uuid.Nil {
+			evidenceArg = evidence
+		}
+		_, err := a.pool.Exec(r.Context(), `INSERT INTO payments(id,gym_id,invoice_id,member_id,amount_minor,method,provider,reference,note,status,evidence_file_id,created_by,idempotency_key)
+			VALUES($1,$2,$3,$4,$5,$6,NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,$11,$12,NULLIF($13,''))
+			ON CONFLICT (gym_id,idempotency_key) DO NOTHING`,
+			id, gym, invoice, member, amount, method, provider, stringValue(body["reference"]), stringValue(body["note"]), status, evidenceArg, actor, r.Header.Get("Idempotency-Key"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "payment_failed", err.Error(), nil)
+			return
+		}
+		if status == "approved" {
+			_, _ = a.pool.Exec(r.Context(), `UPDATE invoices SET paid_minor=paid_minor+$1,status=CASE WHEN paid_minor+$1>=total_minor THEN 'paid' ELSE 'partial' END WHERE id=$2 AND gym_id=$3`, amount, invoice, gym)
+		}
+		writeJSON(http.StatusCreated, map[string]any{"id": id, "status": status, "amount_minor": amount, "provider": provider})
+		return
+
+	case parts[1] == "payments" && len(parts) == 4 && parts[3] == "review" && r.Method == http.MethodPost:
+		paymentID, _ := uuid.Parse(parts[2])
+		body := decode()
+		status := stringValue(body["status"])
+		reason := stringValue(body["reason"])
+		if status != "approved" && status != "rejected" {
+			writeError(w, http.StatusBadRequest, "invalid_status", "status must be approved or rejected", nil)
+			return
+		}
+		if status == "rejected" && reason == "" {
+			writeError(w, http.StatusBadRequest, "reason_required", "reason is required when rejecting", nil)
+			return
+		}
+		tx, err := a.pool.Begin(r.Context())
+		if err != nil {
+			writeError(w, 500, "review_failed", err.Error(), nil)
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		var invoiceID uuid.UUID
+		var amount int64
+		var cur string
+		if err = tx.QueryRow(r.Context(), `SELECT invoice_id,amount_minor,status FROM payments WHERE gym_id=$1 AND id=$2 FOR UPDATE`, gym, paymentID).Scan(&invoiceID, &amount, &cur); err != nil {
+			writeError(w, 404, "not_found", "payment not found", nil)
+			return
+		}
+		if cur != "pending" {
+			writeError(w, 409, "not_pending", "payment is not pending", nil)
+			return
+		}
+		if _, err = tx.Exec(r.Context(), `UPDATE payments SET status=$1,reviewed_by=$2,reviewed_at=now(),rejection_reason=NULLIF($3,'') WHERE id=$4 AND gym_id=$5`, status, actor, reason, paymentID, gym); err != nil {
+			writeError(w, 400, "payment_review_failed", err.Error(), nil)
+			return
+		}
+		if status == "approved" {
+			if _, err = tx.Exec(r.Context(), `UPDATE invoices SET paid_minor=paid_minor+$1,status=CASE WHEN paid_minor+$1>=total_minor THEN 'paid' ELSE 'partial' END WHERE id=$2 AND gym_id=$3`, amount, invoiceID, gym); err != nil {
+				writeError(w, 400, "invoice_update_failed", err.Error(), nil)
+				return
+			}
+		}
+		if err = tx.Commit(r.Context()); err != nil {
+			writeError(w, 500, "review_failed", err.Error(), nil)
+			return
+		}
+		writeJSON(http.StatusOK, map[string]any{"id": paymentID, "status": status, "invoice_id": invoiceID, "amount_minor": amount})
+		return
+
+	case parts[1] == "payments" && len(parts) == 3 && (r.Method == http.MethodPatch || r.Method == http.MethodPost):
+		// Legacy review path — same as /review
+		paymentID, _ := uuid.Parse(parts[2])
+		body := decode()
+		status := stringValue(body["status"])
+		if status == "" {
+			status = "approved"
+		}
+		reason := stringValue(body["reason"])
+		if status != "approved" && status != "rejected" {
+			writeError(w, http.StatusBadRequest, "invalid_status", "status must be approved or rejected", nil)
+			return
+		}
+		tx, err := a.pool.Begin(r.Context())
+		if err != nil {
+			writeError(w, 500, "review_failed", err.Error(), nil)
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		var invoiceID uuid.UUID
+		var amount int64
+		var cur string
+		if err = tx.QueryRow(r.Context(), `SELECT invoice_id,amount_minor,status FROM payments WHERE gym_id=$1 AND id=$2 FOR UPDATE`, gym, paymentID).Scan(&invoiceID, &amount, &cur); err != nil {
+			writeError(w, 404, "not_found", "payment not found", nil)
+			return
+		}
+		if cur != "pending" {
+			writeError(w, 409, "not_pending", "payment is not pending", nil)
+			return
+		}
+		if _, err = tx.Exec(r.Context(), `UPDATE payments SET status=$1,reviewed_by=$2,reviewed_at=now(),rejection_reason=NULLIF($3,'') WHERE id=$4 AND gym_id=$5`, status, actor, reason, paymentID, gym); err != nil {
+			writeError(w, 400, "payment_review_failed", err.Error(), nil)
+			return
+		}
+		if status == "approved" {
+			_, _ = tx.Exec(r.Context(), `UPDATE invoices SET paid_minor=paid_minor+$1,status=CASE WHEN paid_minor+$1>=total_minor THEN 'paid' ELSE 'partial' END WHERE id=$2 AND gym_id=$3`, amount, invoiceID, gym)
+		}
+		_ = tx.Commit(r.Context())
+		writeJSON(http.StatusOK, map[string]any{"id": paymentID, "status": status})
+		return
+
+	case parts[1] == "invoices" && len(parts) == 4 && parts[3] == "payments" && r.Method == http.MethodPost:
+		invoiceID, _ := uuid.Parse(parts[2])
+		body := decode()
+		var memberID uuid.UUID
+		_ = a.pool.QueryRow(r.Context(), `SELECT member_id FROM invoices WHERE gym_id=$1 AND id=$2`, gym, invoiceID).Scan(&memberID)
+		if memberID == uuid.Nil {
+			writeError(w, 404, "not_found", "invoice not found", nil)
+			return
+		}
+		if mid := stringValue(body["member_id"]); mid != "" {
+			if parsed, err := uuid.Parse(mid); err == nil {
+				memberID = parsed
+			}
+		}
+		amount, _ := strconv.ParseInt(stringValue(body["amount_minor"]), 10, 64)
+		method := normalizePayMethod(stringValue(body["method"]))
+		if method == "" {
+			method = "cash"
+		}
+		provider := stringValue(body["provider"])
+		status := "approved"
+		if stringValue(body["evidence_file_id"]) != "" {
+			status = "pending"
+		}
+		id := newUUID()
+		evidence, _ := uuid.Parse(stringValue(body["evidence_file_id"]))
+		var evidenceArg any
+		if evidence != uuid.Nil {
+			evidenceArg = evidence
+		}
+		_, err := a.pool.Exec(r.Context(), `INSERT INTO payments(id,gym_id,invoice_id,member_id,amount_minor,method,provider,reference,note,status,evidence_file_id,created_by,idempotency_key)
+			VALUES($1,$2,$3,$4,$5,$6,NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,$11,$12,NULLIF($13,''))
+			ON CONFLICT (gym_id,idempotency_key) DO NOTHING`,
+			id, gym, invoiceID, memberID, amount, method, provider, stringValue(body["reference"]), stringValue(body["note"]), status, evidenceArg, actor, r.Header.Get("Idempotency-Key"))
+		if err != nil {
+			writeError(w, 400, "payment_failed", err.Error(), nil)
+			return
+		}
+		if status == "approved" {
+			_, _ = a.pool.Exec(r.Context(), `UPDATE invoices SET paid_minor=paid_minor+$1,status=CASE WHEN paid_minor+$1>=total_minor THEN 'paid' ELSE 'partial' END WHERE id=$2 AND gym_id=$3`, amount, invoiceID, gym)
+		}
+		writeJSON(201, map[string]any{"id": id, "status": status, "amount_minor": amount, "invoice_id": invoiceID, "member_id": memberID})
+		return
+
+	case parts[1] == "members" && len(parts) == 4 && parts[3] == "payments" && r.Method == http.MethodGet:
+		memberID, _ := uuid.Parse(parts[2])
+		if !a.canAccessMemberBilling(r.Context(), gym, actor, memberID) {
+			writeError(w, 403, "forbidden", "cannot view these payments", nil)
+			return
+		}
+		rows, err := a.pool.Query(r.Context(), `SELECT id,invoice_id,amount_minor,method,COALESCE(provider,''),status,evidence_file_id,paid_at,COALESCE(reference,''),COALESCE(rejection_reason,'')
+			FROM payments WHERE gym_id=$1 AND member_id=$2 ORDER BY paid_at DESC LIMIT 200`, gym, memberID)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, inv uuid.UUID
+			var method, provider, status, ref, reason string
+			var amount int64
+			var evidence *uuid.UUID
+			var paidAt time.Time
+			if rows.Scan(&id, &inv, &amount, &method, &provider, &status, &evidence, &paidAt, &ref, &reason) == nil {
+				items = append(items, map[string]any{
+					"id": id, "invoice_id": inv, "amount_minor": amount, "method": method, "provider": provider,
+					"status": status, "evidence_file_id": evidence, "paid_at": paidAt, "reference": ref, "rejection_reason": reason,
+				})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "me" && len(parts) == 3 && parts[2] == "invoices" && r.Method == http.MethodGet:
+		var memberID uuid.UUID
+		if err := a.pool.QueryRow(r.Context(), `SELECT id FROM members WHERE gym_id=$1 AND user_id=$2`, gym, actor).Scan(&memberID); err != nil {
+			writeError(w, 404, "not_found", "member profile required", nil)
+			return
+		}
+		rows, err := a.pool.Query(r.Context(), `SELECT id,invoice_number,total_minor,paid_minor,due_at,status FROM invoices WHERE gym_id=$1 AND member_id=$2 ORDER BY due_at DESC LIMIT 100`, gym, memberID)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id uuid.UUID
+			var num, s string
+			var total, paid int64
+			var due time.Time
+			if rows.Scan(&id, &num, &total, &paid, &due, &s) == nil {
+				items = append(items, map[string]any{"id": id, "invoice_number": num, "total_minor": total, "paid_minor": paid, "due_at": due, "status": s, "member_id": memberID})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items, "member_id": memberID})
+		return
+
+	case parts[1] == "me" && len(parts) == 3 && parts[2] == "payments" && r.Method == http.MethodGet:
+		var memberID uuid.UUID
+		if err := a.pool.QueryRow(r.Context(), `SELECT id FROM members WHERE gym_id=$1 AND user_id=$2`, gym, actor).Scan(&memberID); err != nil {
+			writeError(w, 404, "not_found", "member profile required", nil)
+			return
+		}
+		rows, err := a.pool.Query(r.Context(), `SELECT id,invoice_id,amount_minor,method,COALESCE(provider,''),status,evidence_file_id,paid_at,COALESCE(reference,''),COALESCE(rejection_reason,'')
+			FROM payments WHERE gym_id=$1 AND member_id=$2 ORDER BY paid_at DESC LIMIT 100`, gym, memberID)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, inv uuid.UUID
+			var method, provider, status, ref, reason string
+			var amount int64
+			var evidence *uuid.UUID
+			var paidAt time.Time
+			if rows.Scan(&id, &inv, &amount, &method, &provider, &status, &evidence, &paidAt, &ref, &reason) == nil {
+				items = append(items, map[string]any{
+					"id": id, "invoice_id": inv, "amount_minor": amount, "method": method, "provider": provider,
+					"status": status, "evidence_file_id": evidence, "paid_at": paidAt, "reference": ref, "rejection_reason": reason,
+				})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items, "member_id": memberID})
+		return
+
+	case parts[1] == "files" && r.Method == http.MethodPost && len(parts) == 2:
+		if err := r.ParseMultipartForm(16 << 20); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_upload", err.Error(), nil)
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "file_required", "multipart field file is required", nil)
+			return
+		}
+		defer func() { _ = file.Close() }()
+		id := newUUID()
+		key := gym.String() + "/" + id.String()
+		root := os.Getenv("STORAGE_ROOT")
+		if root == "" {
+			root = "storage"
+		}
+		path := filepath.Join(root, key)
+		if err = os.MkdirAll(filepath.Dir(path), 0750); err == nil {
+			var out *os.File
+			out, err = os.Create(path)
+			if err == nil {
+				_, err = io.Copy(out, file)
+				_ = out.Close()
+			}
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "upload_failed", err.Error(), nil)
+			return
+		}
+		_, err = a.pool.Exec(r.Context(), `INSERT INTO files(id,gym_id,object_key,content_type,size_bytes,created_by) VALUES($1,$2,$3,$4,$5,$6)`, id, gym, key, header.Header.Get("Content-Type"), header.Size, actor)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "file_metadata_failed", err.Error(), nil)
+			return
+		}
+		writeJSON(http.StatusCreated, map[string]any{"id": id, "content_type": header.Header.Get("Content-Type"), "size_bytes": header.Size})
+		return
+
+	case parts[1] == "files" && len(parts) == 4 && parts[3] == "signed-url" && r.Method == http.MethodGet:
+		fileID, _ := uuid.Parse(parts[2])
+		var key string
+		if err := a.pool.QueryRow(r.Context(), `SELECT object_key FROM files WHERE gym_id=$1 AND id=$2`, gym, fileID).Scan(&key); err != nil {
+			writeError(w, 404, "not_found", "file not found", nil)
+			return
+		}
+		expires := time.Now().Add(5 * time.Minute).Unix()
+		sig := a.signedFileMAC(fileID, expires)
+		writeJSON(http.StatusOK, map[string]any{"file_id": fileID, "url": "/v1/files/" + fileID.String() + "/content?expires=" + strconv.FormatInt(expires, 10) + "&sig=" + sig, "expires_at": time.Unix(expires, 0)})
+		return
+
+	case parts[1] == "files" && len(parts) == 4 && parts[3] == "content" && r.Method == http.MethodGet:
+		fileID, _ := uuid.Parse(parts[2])
+		exp, _ := strconv.ParseInt(r.URL.Query().Get("expires"), 10, 64)
+		sig := r.URL.Query().Get("sig")
+		if exp <= 0 || time.Now().Unix() > exp || sig == "" || !hmac.Equal([]byte(sig), []byte(a.signedFileMAC(fileID, exp))) {
+			writeError(w, http.StatusUnauthorized, "signed_url_expired", "signed file URL is invalid or expired", nil)
+			return
+		}
+		var key, contentType string
+		if err := a.pool.QueryRow(r.Context(), `SELECT object_key,content_type FROM files WHERE gym_id=$1 AND id=$2`, gym, fileID).Scan(&key, &contentType); err != nil {
+			writeError(w, 404, "not_found", "file not found", nil)
+			return
+		}
+		root := os.Getenv("STORAGE_ROOT")
+		if root == "" {
+			root = "storage"
+		}
+		f, err := os.Open(filepath.Join(root, key))
+		if err != nil {
+			writeError(w, 404, "not_found", "file content not found", nil)
+			return
+		}
+		defer func() { _ = f.Close() }()
+		w.Header().Set("Content-Type", contentType)
+		_, _ = io.Copy(w, f)
+		return
+
+	case parts[1] == "invoices" && r.Method == http.MethodGet:
+		q := `SELECT i.id,i.member_id,COALESCE(u.name,''),i.invoice_number,i.total_minor,i.paid_minor,i.due_at,i.status
+			FROM invoices i JOIN members m ON m.id=i.member_id JOIN users u ON u.id=m.user_id
+			WHERE i.gym_id=$1`
+		args := []any{gym}
+		if !a.isStaffUser(r.Context(), actor) {
+			var mid uuid.UUID
+			if err := a.pool.QueryRow(r.Context(), `SELECT id FROM members WHERE gym_id=$1 AND user_id=$2`, gym, actor).Scan(&mid); err != nil {
+				writeError(w, 403, "forbidden", "member profile required", nil)
+				return
+			}
+			args = append(args, mid)
+			q += ` AND i.member_id=$2`
+		}
+		q += ` ORDER BY i.due_at DESC LIMIT 200`
+		rows, err := a.pool.Query(r.Context(), q, args...)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, m uuid.UUID
+			var memberName, n, s string
+			var total, paid int64
+			var due time.Time
+			if rows.Scan(&id, &m, &memberName, &n, &total, &paid, &due, &s) == nil {
+				items = append(items, map[string]any{
+					"id": id, "member_id": m, "member_name": memberName, "invoice_number": n,
+					"total_minor": total, "paid_minor": paid, "due_at": due, "status": s,
+				})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "bookings" && r.Method == http.MethodPost && len(parts) == 3:
+		session, _ := uuid.Parse(parts[2])
+		body := decode()
+		member, _ := uuid.Parse(stringValue(body["member_id"]))
+		if member == uuid.Nil {
+			member = actor
+		}
+		tx, err := a.pool.Begin(r.Context())
+		if err != nil {
+			writeError(w, 500, "booking_failed", err.Error(), nil)
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		var capacity int
+		var cancelled *time.Time
+		if err = tx.QueryRow(r.Context(), `SELECT capacity,cancelled_at FROM class_sessions WHERE gym_id=$1 AND id=$2 FOR UPDATE`, gym, session).Scan(&capacity, &cancelled); err != nil || cancelled != nil {
+			writeError(w, 409, "session_unavailable", "session is unavailable", nil)
+			return
+		}
+		var booked int
+		_ = tx.QueryRow(r.Context(), `SELECT count(*) FROM class_bookings WHERE gym_id=$1 AND session_id=$2 AND status='booked'`, gym, session).Scan(&booked)
+		if booked >= capacity {
+			writeError(w, 409, "session_full", "class session is full", nil)
+			return
+		}
+		_, err = tx.Exec(r.Context(), `INSERT INTO class_bookings(id,session_id,gym_id,member_id) VALUES($1,$2,$3,$4) ON CONFLICT(session_id,member_id) DO UPDATE SET status='booked'`, newUUID(), session, gym, member)
+		if err == nil {
+			err = tx.Commit(r.Context())
+		}
+		if err != nil {
+			writeError(w, 400, "booking_failed", err.Error(), nil)
+			return
+		}
+		writeJSON(201, map[string]any{"session_id": session, "member_id": member, "status": "booked"})
+		return
+
+	case parts[1] == "trainers" && r.Method == http.MethodGet:
+		rows, err := a.pool.Query(r.Context(), `SELECT u.id,u.email,COALESCE(u.name,''),
+			(SELECT count(*) FROM trainer_assignments ta WHERE ta.trainer_user_id=u.id AND ta.ended_at IS NULL)
+			FROM users u JOIN user_staff_roles r ON r.user_id=u.id
+			WHERE u.gym_id=$1 AND r.role='trainer' AND u.deactivated_at IS NULL ORDER BY u.email`, gym)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id uuid.UUID
+			var email, name string
+			var clients int
+			if rows.Scan(&id, &email, &name, &clients) == nil {
+				items = append(items, map[string]any{"id": id, "email": email, "name": name, "client_count": clients})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "sessions" && r.Method == http.MethodGet && len(parts) == 2:
+		rows, err := a.pool.Query(r.Context(), `SELECT s.id,s.class_type_id,ct.name,s.branch_id,s.trainer_user_id,COALESCE(u.name,''),s.starts_at,s.ends_at,s.capacity,s.cancelled_at,
+			(SELECT count(*) FROM class_bookings b WHERE b.session_id=s.id AND b.status='booked')
+			FROM class_sessions s
+			JOIN class_types ct ON ct.id=s.class_type_id
+			LEFT JOIN users u ON u.id=s.trainer_user_id
+			WHERE s.gym_id=$1 AND s.starts_at>=COALESCE(NULLIF($2,'')::timestamptz,now()-interval '1 day')
+			ORDER BY s.starts_at LIMIT 200`, gym, r.URL.Query().Get("from"))
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, ct, b uuid.UUID
+			var trainer *uuid.UUID
+			var name, trainerName string
+			var st, en time.Time
+			var cap, booked int
+			var cancelled *time.Time
+			if rows.Scan(&id, &ct, &name, &b, &trainer, &trainerName, &st, &en, &cap, &cancelled, &booked) == nil {
+				items = append(items, map[string]any{
+					"id": id, "class_type_id": ct, "name": name, "branch_id": b,
+					"trainer_user_id": trainer, "trainer_name": trainerName,
+					"starts_at": st, "ends_at": en, "capacity": cap, "booked": booked, "cancelled_at": cancelled,
+				})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "trainers" && len(parts) == 4 && parts[3] == "availability" && r.Method == http.MethodGet:
+		trainer, _ := uuid.Parse(parts[2])
+		rows, err := a.pool.Query(r.Context(), `SELECT id,branch_id,starts_at,ends_at FROM trainer_availability WHERE gym_id=$1 AND trainer_user_id=$2 AND ends_at>now() ORDER BY starts_at`, gym, trainer)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id uuid.UUID
+			var branch *uuid.UUID
+			var st, en time.Time
+			if rows.Scan(&id, &branch, &st, &en) == nil {
+				items = append(items, map[string]any{"id": id, "branch_id": branch, "starts_at": st, "ends_at": en})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "workouts" && r.Method == http.MethodPost && len(parts) == 3:
+		member, _ := uuid.Parse(parts[2])
+		body := decode()
+		title := stringValue(body["title"])
+		if title == "" {
+			title = "Workout"
+		}
+		notes := stringValue(body["notes"])
+		metrics, _ := json.Marshal(body["metrics"])
+		id := newUUID()
+		_, err := a.pool.Exec(r.Context(), `INSERT INTO workout_logs(id,gym_id,member_id,author_user_id,title,notes,metrics) VALUES($1,$2,$3,$4,$5,$6,$7)`, id, gym, member, actor, title, notes, metrics)
+		if err != nil {
+			writeError(w, 400, "workout_failed", err.Error(), nil)
+			return
+		}
+		writeJSON(201, map[string]any{"id": id, "member_id": member, "title": title, "notes": notes, "metrics": body["metrics"]})
+		return
+
+	case parts[1] == "members" && len(parts) == 4 && parts[3] == "workouts" && r.Method == http.MethodGet:
+		member, _ := uuid.Parse(parts[2])
+		rows, err := a.pool.Query(r.Context(), `SELECT id,title,notes,performed_at,metrics FROM workout_logs WHERE gym_id=$1 AND member_id=$2 ORDER BY performed_at DESC LIMIT 200`, gym, member)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id uuid.UUID
+			var title string
+			var notes *string
+			var at time.Time
+			var metrics []byte
+			if rows.Scan(&id, &title, &notes, &at, &metrics) == nil {
+				var m any
+				_ = json.Unmarshal(metrics, &m)
+				items = append(items, map[string]any{"id": id, "title": title, "notes": notes, "performed_at": at, "metrics": m})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "members" && len(parts) == 4 && parts[3] == "measurements" && r.Method == http.MethodGet:
+		member, _ := uuid.Parse(parts[2])
+		rows, err := a.pool.Query(r.Context(), `SELECT id,kind,value,unit,measured_at FROM progress_measurements WHERE gym_id=$1 AND member_id=$2 ORDER BY measured_at DESC LIMIT 200`, gym, member)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id uuid.UUID
+			var kind, unit string
+			var value float64
+			var at time.Time
+			if rows.Scan(&id, &kind, &value, &unit, &at) == nil {
+				items = append(items, map[string]any{"id": id, "kind": kind, "value": value, "unit": unit, "measured_at": at})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "class-types" && r.Method == http.MethodGet:
+		rows, err := a.pool.Query(r.Context(), `SELECT id,name,COALESCE(description,''),capacity FROM class_types WHERE gym_id=$1 ORDER BY name`, gym)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id uuid.UUID
+			var name, desc string
+			var cap int
+			if rows.Scan(&id, &name, &desc, &cap) == nil {
+				items = append(items, map[string]any{"id": id, "name": name, "description": desc, "capacity": cap})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "hours" && r.Method == http.MethodGet:
+		branchID := r.URL.Query().Get("branch_id")
+		q := `SELECT h.id,h.branch_id,h.weekday,h.opens_at::text,h.closes_at::text FROM branch_hours h JOIN branches b ON b.id=h.branch_id WHERE b.gym_id=$1`
+		args := []any{gym}
+		if branchID != "" {
+			bid, _ := uuid.Parse(branchID)
+			q += ` AND h.branch_id=$2`
+			args = append(args, bid)
+		}
+		q += ` ORDER BY h.branch_id,h.weekday`
+		rows, err := a.pool.Query(r.Context(), q, args...)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id, bid uuid.UUID
+			var weekday int
+			var opens, closes string
+			if rows.Scan(&id, &bid, &weekday, &opens, &closes) == nil {
+				items = append(items, map[string]any{"id": id, "branch_id": bid, "weekday": weekday, "opens_at": opens, "closes_at": closes})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "holidays" && r.Method == http.MethodGet:
+		rows, err := a.pool.Query(r.Context(), `SELECT id,date::text,name FROM gym_holidays WHERE gym_id=$1 ORDER BY date`, gym)
+		if err != nil {
+			writeError(w, 500, "query_failed", err.Error(), nil)
+			return
+		}
+		defer rows.Close()
+		items := []any{}
+		for rows.Next() {
+			var id uuid.UUID
+			var date, name string
+			if rows.Scan(&id, &date, &name) == nil {
+				items = append(items, map[string]any{"id": id, "date": date, "name": name})
+			}
+		}
+		writeJSON(200, map[string]any{"items": items})
+		return
+
+	case parts[1] == "reports" && r.Method == http.MethodGet:
+		var active, attendance, revenue, churn int64
+		_ = a.pool.QueryRow(r.Context(), `SELECT count(*) FROM members WHERE gym_id=$1 AND status='active'`, gym).Scan(&active)
+		_ = a.pool.QueryRow(r.Context(), `SELECT count(*) FROM attendance_events WHERE gym_id=$1 AND voided_at IS NULL`, gym).Scan(&attendance)
+		_ = a.pool.QueryRow(r.Context(), `SELECT COALESCE(sum(amount_minor),0) FROM payments WHERE gym_id=$1 AND status='approved'`, gym).Scan(&revenue)
+		_ = a.pool.QueryRow(r.Context(), `SELECT count(*) FROM members WHERE gym_id=$1 AND status='archived'`, gym).Scan(&churn)
+		payload := map[string]any{"active_members": active, "attendance": attendance, "revenue_minor": revenue, "churn": churn, "count": active}
+		if len(parts) >= 3 {
+			switch parts[2] {
+			case "active-members":
+				writeJSON(http.StatusOK, map[string]any{"active_members": active, "count": active})
+				return
+			case "revenue":
+				writeJSON(http.StatusOK, map[string]any{"revenue_minor": revenue, "total_minor": revenue})
+				return
+			case "churn":
+				writeJSON(http.StatusOK, map[string]any{"churn": churn, "count": churn})
+				return
+			case "attendance":
+				writeJSON(http.StatusOK, map[string]any{"attendance": attendance, "count": attendance})
+				return
+			}
+		}
+		writeJSON(http.StatusOK, payload)
+		return
+	}
+	writeJSON(http.StatusOK, map[string]any{"items": []any{}, "path": r.URL.Path, "method": r.Method})
+}
+
+func stringValue(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case json.Number:
+		return x.String()
+	default:
+		return ""
+	}
+}
+
+func normalizePayMethod(m string) string {
+	m = strings.TrimSpace(strings.ToLower(m))
+	switch m {
+	case "bank_transfer":
+		return "bank"
+	case "cash", "bank", "mobile_money", "card", "gateway":
+		return m
+	default:
+		return m
+	}
+}
+
+func (a *apiImpl) isStaffUser(ctx context.Context, userID uuid.UUID) bool {
+	var n int
+	_ = a.pool.QueryRow(ctx, `SELECT count(*) FROM user_staff_roles WHERE user_id=$1`, userID).Scan(&n)
+	return n > 0
+}
+
+func (a *apiImpl) canAccessMemberBilling(ctx context.Context, gymID, actor, memberID uuid.UUID) bool {
+	if a.isStaffUser(ctx, actor) {
+		return true
+	}
+	var own uuid.UUID
+	err := a.pool.QueryRow(ctx, `SELECT id FROM members WHERE gym_id=$1 AND user_id=$2`, gymID, actor).Scan(&own)
+	return err == nil && own == memberID
+}

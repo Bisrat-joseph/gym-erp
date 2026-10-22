@@ -1,0 +1,230 @@
+schema: spec-driven
+
+# Shown to AI when creating artifacts. Keep in sync with AGENTS.md.
+context: |
+  # GymPulse
+
+  GymPulse is a self-hostable gym management product. A gym owner deploys
+  their own instance. It covers members and memberships, check-in and
+  attendance, payments and billing, class scheduling and booking, trainers
+  and coaches, workout and progress tracking, and business reports.
+
+  One gym per deployment. The data model includes gym and branch from day
+  one; the MVP runs a single gym with a single branch. Multi-branch comes
+  later without a schema rewrite.
+
+  ## Repository layout
+
+  gympulse/
+    server/              Go backend — single source of truth, owns the schema
+    admin/               React + Vite staff dashboard
+    app/                 React + Vite PWA (members and trainers)
+    landing/             Vue + Vite public marketing site
+    packages/api-client  Generated OpenAPI TypeScript client
+    openapi.yaml         OpenAPI 3.1 source of truth for HTTP /v1
+    Makefile             dev, run, test, lint, generate, build, migrate-*, db-create
+    openspec/            Specs, changes, and this project context
+
+  Go module path: gympulse-server (cmd/gympulse).
+  JS packages are independent (not a monorepo workspace): install
+  inside each of admin/, app/, landing/, and packages/api-client/.
+  admin depends on packages/api-client via a local file: link.
+
+  ## How to run everything locally
+
+  1. Copy `.env.example` to `.env` and set secrets (at least DATABASE_URL,
+     AUTH_JWT_SECRET). DATABASE_URL MUST be a direct or session-mode
+     Postgres URL. Do not use a transaction-mode pooler. Supabase is not
+     a supported target.
+  2. Install PostgreSQL 16+ on the host (see README for Fedora). Create
+     the gympulse role once (CREATEDB). `make db-create` creates the app
+     database if missing.
+  3. `make generate` — oapi-codegen (sqlc and openapi-typescript are added
+     by later changes).
+  4. `make migrate-up` — apply embedded migrations.
+  5. `make dev` — `go run ./cmd/gympulse` with `.env` loaded.
+  6. `make test` — Go tests against local Postgres 16 via TEST_DATABASE_URL
+     (`gympulse_test_*` databases). Do not mock the database.
+  7. `make lint` and `make build`.
+
+  TLS and static apps: install Caddy or nginx on the host
+  (`docs/reverse-proxy.md`). Suggested hostnames: api.<domain>,
+  admin.<domain>, app.<domain>, and the root domain for landing.
+
+  ## Core architecture (non-negotiable)
+
+  - The Go server is the only process that talks to the database.
+  - admin, app, and landing MUST use the server REST API only, via
+    packages/api-client (generated from openapi.yaml).
+  - PostgreSQL is the only database. There is no BaaS and no frontend DB client.
+  - Auth is owned by the Go server. A user account MAY have a member profile
+    and/or one or more staff roles (owner, manager, receptionist, trainer).
+    The PWA switches views from what the account actually has. Authorization
+    is enforced in Go on every protected route.
+  - BaaS-style concerns go behind Go interfaces with swappable drivers:
+    - File storage: local disk and S3-compatible (MinIO/S3)
+    - Realtime/notifications later (SSE/WebSocket + web push); no change yet
+    - SMS, email, payment gateways: interfaces with a manual/no-op default
+  - Domain rows are scoped by gym_id (and branch_id when branch-local).
+
+  ## Database and migrations
+
+  - PostgreSQL **16+** installed on the host. UUIDv7 generated in Go.
+  - Single DATABASE_URL (direct Postgres or session-mode pooler only;
+    never a transaction-mode pooler). Default schema (`public`). No
+    search_path tricks. Supabase is not a supported target.
+  - SQL files in server/migrations/, goose Provider API + Postgres session
+    locker, go:embed. AUTO_MIGRATE defaults to false.
+  - Commands: gympulse migrate up | down | status, gympulse db create
+    (also `make migrate-*` and `make db-create`).
+  - **Forward-only in production.** `down` is for local development only;
+    production rollback is restore from a documented pg_dump.
+  - gyms row includes IANA time zone and ISO currency code.
+
+  ## API contract (spec-first)
+
+  - `openapi.yaml` (OpenAPI 3.1) is the source of truth for HTTP `/v1`.
+  - Go: oapi-codegen (chi server, strict handlers) plus request validation
+    middleware against the spec.
+  - TypeScript: openapi-typescript + openapi-fetch → packages/api-client
+    (admin-app-core; bootstrap-server generates Go only).
+  - Every change that adds or changes endpoints MUST update openapi.yaml
+    and run `make generate`. CI fails if generate produces a diff.
+  - Server-side validation on every input, matching the OpenAPI schema.
+  - JSON snake_case; errors
+    { "error": { "code": "...", "message": "...", "details": {} } }
+  - Pagination: cursor + limit (offset only for reports).
+
+  ## Backend conventions (locked)
+
+  - Passwords: argon2id. Never log passwords.
+  - Access tokens: JWT via golang-jwt/jwt/v5, HS256, **15 minutes**.
+  - Refresh tokens: opaque, rotating, stored hashed. Reuse of a rotated
+    token MUST revoke the entire token family.
+  - Refresh transport: httpOnly Secure cookie on the API host (see
+    auth-and-roles design). JSON body is fallback only.
+  - Time: all timestamps `timestamptz` stored in UTC. Each gym has an IANA
+    time zone for schedules and reports. API times are RFC 3339 UTC.
+  - Money: integer minor units plus the gym's ISO currency code. Never floats.
+  - Config: env parsed into a typed struct with caarlos0/env, validated at
+    startup, fail-fast on missing or invalid values.
+  - Logging: slog JSON with request IDs. Keep GET /health and GET /ready.
+  - HTTP: chi. Queries: sqlc + pgx (default protocol).
+  - Tests: local PostgreSQL 16 via TEST_DATABASE_URL and gympulse_test_*
+    databases. Do not mock the database. Do not use Docker or testcontainers.
+  - IDs: UUIDv7 in Go. Plural snake_case tables.
+  - Lint: gofmt + golangci-lint. Commits: Conventional Commits.
+  - Branches: feat/<openspec-change-name>
+
+  ## Frontend (locked)
+
+  - admin, app: React + Vite + TypeScript SPAs.
+  - landing: Vue 3 + Vite marketing site with a static HTML SEO shell
+    (canonical/OG/JSON-LD, robots.txt, sitemap.xml via VITE_SITE_URL).
+    Live leads form and public schedule API binding may follow later.
+  - Shared (admin/app): Tailwind CSS, shadcn/ui, TanStack Query, TanStack Router,
+    react-hook-form + zod, packages/api-client.
+  - landing packages are independent of the admin/app TanStack stack.
+  - TanStack Router (not React Router): type-safe routes and search params
+    that compose with zod and TanStack Query; one TanStack stack.
+  - i18n: react-i18next, JSON catalogs, English default. No hard-coded UI
+    strings (catalog keys only).
+  - PWA (app): vite-plugin-pwa / Workbox. Cache the app shell and the
+    member's last-known check-in QR for offline display. Do not cache
+    authenticated `/v1` JSON long-term as the source of truth
+    (network-first). On logout the service worker MUST clear all caches
+    (cached QR and cached API data).
+
+  ## Workflow
+
+  Backend first. Apply changes in this order:
+    1. bootstrap-server
+    2. database-migrations
+    3. auth-and-roles
+    4. storage
+    5. members-and-memberships (includes leads)
+    6. checkin-attendance
+    7. billing-payments
+    8. admin-app-core
+    9. reporting
+    10. classes-booking
+    11. trainers-clients
+    12. workouts-progress
+    13. admin-app-complete
+    14. member-trainer-pwa
+    15. landing-site
+  notifications is specified but has no change folder yet.
+  Every non-trivial change is an OpenSpec proposal the user approves before
+  implementation. Archive only after the user confirms.
+
+  ## Out of scope until a later change
+
+  Payment gateway charge APIs, SMS delivery, multi-branch UX, multi-gym
+  SaaS, native mobile apps, notifications implementation.
+
+rules:
+  proposal:
+    - Keep proposals under two pages
+    - Keep changes small and independently shippable
+    - Backend slices land before the frontend that consumes them
+    - Do not start implementation in the same turn as planning
+  specs:
+    - Use SHALL/MUST; every requirement needs at least one WHEN/THEN scenario
+    - Specs describe observable behavior, not framework internals
+  tasks:
+    - Every checkbox includes how to verify it
+    - Tasks that add HTTP endpoints also update openapi.yaml and make generate
+  design:
+    - Record why goose Provider, chi, sqlc, oapi-codegen, TanStack Router, and Astro were chosen when those decisions are in scope
+
+conventions: |
+  ## API Conventions (Section B — locked)
+
+  ### Identifiers and timestamps
+  - All resource ids are UUID v7, generated in Go.
+  - Timestamps are RFC 3339 UTC (`date-time` format).
+  - Dates are ISO 8601 (`date` format, e.g. `2024-01-15`).
+  - Times (schedule slots, business hours) are `"HH:MM"` in the gym/branch local IANA time zone.
+  - Weekday integers follow ISO 8601: Monday = 1, Sunday = 7.
+
+  ### Money
+  - All monetary amounts are int64 in the currency's minor unit (e.g. cents), field suffix `_minor`.
+  - The parent resource carries a `currency` field (ISO 4217 uppercase, e.g. `"USD"`).
+  - No floats anywhere in the API.
+
+  ### Enums
+  - All enum values are `lower_snake_case`.
+
+  ### Resources
+  - Every resource has `id`, `created_at`, and `updated_at`.
+  - Archivable resources have `archived_at` (nullable).
+
+  ### Errors
+  - All errors use `{ "error": { "code": str, "message": str, "request_id": str, "details": {...} } }`.
+  - Validation errors include `details.fields: [{ "field": str, "code": str, "message": str }]`.
+  - `429` responses include a `Retry-After` header (seconds).
+
+  ### Idempotency
+  - POST operations that create money or attendance side effects accept `Idempotency-Key` header (8–128 chars).
+  - Keys are scoped per authenticated user + endpoint, expire after 24 hours.
+  - Same key + same body: replay the original response status and body, add `Idempotent-Replayed: true` header.
+  - Same key + different body: 422 with `error.code: idempotency_conflict`.
+
+  ### Role-based access (auth-and-roles)
+  - Only an `owner` may grant or revoke the `owner` and `manager` roles.
+  - A `manager` may invite and edit `receptionist` and `trainer` accounts only.
+  - The last active `owner` MUST NOT be deactivated, demoted, or have their roles removed (409, `error.code: last_owner`).
+
+operations:
+  apply:
+    guidance:
+      - Do not implement until the user explicitly asks to apply the change
+      - Build backend first; do not start frontend feature work until the matching server API exists
+      - Update openapi.yaml for any new or changed HTTP endpoint, then make generate
+      - PostgreSQL only; generate UUIDv7 in Go; argon2id; no DB mocks; local Postgres via TEST_DATABASE_URL
+      - React + Vite for admin/app; Vue + Vite for landing (SEO shell at build); i18n catalogs for admin/app
+      - Follow the change order in project context
+  archive:
+    guidance:
+      - Archive only after implementation is complete and the user confirms
+      - Summarize what merged into main specs before finishing
