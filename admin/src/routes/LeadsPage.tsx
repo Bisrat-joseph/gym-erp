@@ -50,7 +50,7 @@ export function LeadsPage() {
   return (
     <PageCard title={t("leads.title")}>
       {(leads.data ?? []).length === 0 ? (
-        <p className="text-sm text-muted">{t("leads.empty")}</p>
+        <p className="text-sm font-medium text-muted py-4">{t("leads.empty")}</p>
       ) : (
         <SoftTable
           headers={[t("members.name"), t("leads.contact"), t("leads.status"), t("common.actions")]}
@@ -58,10 +58,12 @@ export function LeadsPage() {
             const row = asRecord(lead);
             const id = str(row.id, "");
             return [
-              str(row.name),
-              str(row.contact),
-              str(row.status, "open"),
-              <GhostButton key="c" type="button" onClick={() => setConvertId(id)}>
+              <span key="n" className="font-semibold text-ink">{str(row.name)}</span>,
+              <span key="c" className="text-muted">{str(row.contact)}</span>,
+              <span key="s" className="inline-block rounded-full bg-teal-100/90 text-teal-800 px-3 py-1 text-xs font-bold">
+                {str(row.status, "open")}
+              </span>,
+              <GhostButton key="act" type="button" onClick={() => setConvertId(id)} className="text-xs py-1.5 px-3">
                 {t("leads.convert")}
               </GhostButton>,
             ];
@@ -71,7 +73,7 @@ export function LeadsPage() {
 
       {convertId ? (
         <form
-          className="mt-6 flex flex-wrap items-end gap-3 rounded-[24px] bg-lavender/50 p-4"
+          className="mt-6 flex flex-wrap items-end gap-3 rounded-[24px] bg-purple-50/70 border border-purple-100/60 p-5"
           onSubmit={(e) => {
             e.preventDefault();
             convert.mutate();

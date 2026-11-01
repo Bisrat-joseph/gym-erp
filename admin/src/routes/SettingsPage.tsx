@@ -1,15 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Moon, Sun } from "lucide-react";
 import { api, getSession } from "@/lib/auth";
 import { asRecord, str } from "@/lib/utils";
 import { Field, PageCard, PrimaryButton, SoftTable, TextInput } from "@/components/ui";
+import { useTheme } from "@/lib/theme";
 
 const weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 export function SettingsPage() {
   const { t } = useTranslation();
   const qc = useQueryClient();
+  const { theme, toggleTheme } = useTheme();
   const [form, setForm] = useState({
     name: "",
     timezone: "",
@@ -93,10 +96,39 @@ export function SettingsPage() {
   const holidayItems = holidays.data?.items ?? [];
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      {/* Appearance / Theme Settings Card */}
+      <PageCard title="Appearance">
+        <div className="flex items-center justify-between py-2">
+          <div>
+            <div className="text-sm font-bold text-ink">Dark Mode</div>
+            <div className="text-xs text-muted mt-0.5">
+              Switch between light glass and dark glass themes.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={toggleTheme}
+            className="flex items-center gap-2.5 rounded-full border border-line bg-surface/70 px-4 py-2 text-sm font-bold text-ink transition-all hover:bg-white dark:hover:bg-card hover:shadow-xs active:scale-95"
+          >
+            {theme === "dark" ? (
+              <>
+                <Sun className="size-4 text-amber-400" />
+                <span>Light Mode</span>
+              </>
+            ) : (
+              <>
+                <Moon className="size-4 text-purple-600" />
+                <span>Dark Mode</span>
+              </>
+            )}
+          </button>
+        </div>
+      </PageCard>
+
       <PageCard title={t("settings.gym")}>
         <form
-          className="grid gap-3 md:grid-cols-2"
+          className="grid gap-4 md:grid-cols-2"
           onSubmit={(e) => {
             e.preventDefault();
             save.mutate();
@@ -120,7 +152,7 @@ export function SettingsPage() {
           <Field label={t("settings.address")}>
             <TextInput value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} />
           </Field>
-          <div className="md:col-span-2">
+          <div className="md:col-span-2 pt-2">
             <PrimaryButton type="submit" disabled={save.isPending}>
               {t("settings.save")}
             </PrimaryButton>
@@ -140,7 +172,7 @@ export function SettingsPage() {
 
       <PageCard title="Branch hours">
         {hourItems.length === 0 ? (
-          <p className="text-sm text-muted">{t("common.none")}</p>
+          <p className="text-sm font-medium text-muted py-2">{t("common.none")}</p>
         ) : (
           <SoftTable
             headers={["Day", "Opens", "Closes"]}
@@ -155,7 +187,7 @@ export function SettingsPage() {
 
       <PageCard title="Holidays">
         {holidayItems.length === 0 ? (
-          <p className="text-sm text-muted">{t("common.none")}</p>
+          <p className="text-sm font-medium text-muted py-2">{t("common.none")}</p>
         ) : (
           <SoftTable
             headers={["Date", "Name"]}

@@ -47,23 +47,25 @@ export function AppShell() {
   const showRight = path === "/" || path === "";
 
   return (
-    <div className="flex min-h-screen bg-surface">
-      <aside className="sticky top-0 hidden h-dvh shrink-0 lg:block">
+    <div className="flex min-h-screen bg-transparent">
+      <aside className="sticky top-0 hidden h-dvh shrink-0 lg:block z-20">
         <Sidebar />
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="border-b border-line bg-white p-3 lg:hidden">
+        <div className="border-b border-line/60 bg-white/70 backdrop-blur-md p-3 lg:hidden">
           <Sidebar variant="drawer" />
         </div>
 
-        <div className="flex min-w-0 flex-1 gap-5 p-4 md:p-6">
+        <div className="flex min-w-0 flex-1 gap-6 p-4 md:p-8">
           <div className="min-w-0 flex-1">
             <TopBar search={search} onSearch={setSearch} />
-            <Outlet />
+            <main>
+              <Outlet />
+            </main>
           </div>
           {showRight ? (
-            <div className="sticky top-6 hidden h-[calc(100vh-3rem)] shrink-0 overflow-auto xl:block">
+            <div className="sticky top-8 hidden h-[calc(100vh-4rem)] shrink-0 overflow-auto xl:block">
               <RightRail
                 gymName={str(asRecord(gym.data).name, "") || undefined}
                 overdueCount={(overdue.data?.items ?? []).length}

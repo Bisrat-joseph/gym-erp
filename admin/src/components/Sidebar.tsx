@@ -47,24 +47,26 @@ export function Sidebar({ variant = "rail" }: { variant?: "rail" | "drawer" }) {
   return (
     <aside
       className={cn(
-        "flex flex-col bg-white",
+        "flex flex-col bg-white/75 dark:bg-[#151622]/80 backdrop-blur-xl transition-all duration-300",
         variant === "rail"
-          ? "h-full w-[248px] border-r border-line p-5"
-          : "w-full rounded-2xl border border-line p-3",
+          ? "h-full w-[240px] border-r border-white/60 dark:border-white/10 p-5 shadow-[4px_0_24px_rgba(30,40,60,0.03)] dark:shadow-none"
+          : "w-full rounded-3xl border border-white/80 dark:border-white/10 p-4 shadow-sm",
       )}
     >
-      <div className={cn("mb-6 flex items-center gap-3", variant === "rail" ? "px-1" : "px-0")}>
-        <img src="/logo.png" alt="" className="h-11 w-auto rounded-xl object-contain" />
+      <div className={cn("mb-6 flex items-center gap-3", variant === "rail" ? "px-2" : "px-1")}>
+        <div className="flex size-11 items-center justify-center rounded-2xl bg-white dark:bg-white/10 shadow-sm ring-1 ring-black/5 dark:ring-white/10">
+          <img src="/logo.png" alt="" className="h-8 w-auto object-contain" />
+        </div>
         <div>
-          <div className="text-lg font-bold tracking-tight text-ink">{t("app.name")}</div>
-          <div className="text-xs font-medium text-muted">Admin</div>
+          <div className="text-lg font-extrabold tracking-tight text-ink">{t("app.name")}</div>
+          <div className="text-xs font-semibold text-muted">Admin Console</div>
         </div>
       </div>
 
       <nav
         className={cn(
           "flex gap-1.5",
-          variant === "rail" ? "flex-1 flex-col" : "flex-wrap",
+          variant === "rail" ? "flex-1 flex-col overflow-y-auto pr-1" : "flex-wrap",
         )}
       >
         {items
@@ -76,27 +78,37 @@ export function Sidebar({ variant = "rail" }: { variant?: "rail" | "drawer" }) {
                 key={item.to}
                 to={item.to}
                 className={cn(
-                  "flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-semibold transition",
+                  "relative flex items-center gap-3 rounded-full px-4 py-2.5 text-sm font-semibold transition-all duration-200",
                   isActive
-                    ? "bg-ink text-white shadow-md shadow-ink/20"
-                    : "text-ink-soft hover:bg-surface",
+                    ? "bg-white dark:bg-white/10 text-ink shadow-[0_4px_16px_rgba(26,27,47,0.08)] ring-1 ring-black/[0.04] dark:ring-white/10 font-bold"
+                    : "text-ink-soft/80 hover:bg-white/60 dark:hover:bg-white/5 hover:text-ink",
                 )}
               >
-                <item.icon className="size-4.5 opacity-90" />
-                {t(`nav.${item.key}`)}
+                <item.icon
+                  className={cn(
+                    "size-4.5 transition-colors",
+                    isActive ? "text-teal font-bold" : "text-muted"
+                  )}
+                />
+                <span>{t(`nav.${item.key}`)}</span>
+                {isActive && (
+                  <span className="ml-auto size-1.5 rounded-full bg-teal" />
+                )}
               </Link>
             );
           })}
       </nav>
 
-      <button
-        type="button"
-        onClick={() => void onLogout()}
-        className="mt-4 flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-semibold text-muted transition hover:bg-surface hover:text-ink"
-      >
-        <LogOut className="size-4.5" />
-        {t("nav.logout")}
-      </button>
+      <div className="pt-3 border-t border-line/60">
+        <button
+          type="button"
+          onClick={() => void onLogout()}
+          className="flex w-full items-center gap-3 rounded-full px-4 py-2.5 text-sm font-semibold text-muted transition hover:bg-white/80 dark:hover:bg-white/10 hover:text-ink hover:shadow-xs"
+        >
+          <LogOut className="size-4.5" />
+          {t("nav.logout")}
+        </button>
+      </div>
     </aside>
   );
 }

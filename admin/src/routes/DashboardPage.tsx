@@ -51,9 +51,9 @@ export function DashboardPage() {
   const sessionItems = sessions.data?.items ?? [];
 
   return (
-    <div className="space-y-5">
-      <div className="grid gap-4 md:grid-cols-3">
-        <Link to="/members" className="block transition hover:opacity-95">
+    <div className="space-y-6">
+      <div className="grid gap-5 md:grid-cols-3">
+        <Link to="/members" className="block transition-transform duration-200 hover:-translate-y-0.5">
           <StatTile
             title={t("dashboard.activeMembers")}
             value={members.data?.length ?? "—"}
@@ -61,7 +61,7 @@ export function DashboardPage() {
             icon={<Users className="size-5" />}
           />
         </Link>
-        <Link to="/checkin" className="block transition hover:opacity-95">
+        <Link to="/checkin" className="block transition-transform duration-200 hover:-translate-y-0.5">
           <StatTile
             title={t("dashboard.checkinsToday")}
             value={checkinItems.length || "—"}
@@ -69,7 +69,7 @@ export function DashboardPage() {
             icon={<ScanLine className="size-5" />}
           />
         </Link>
-        <Link to="/leads" className="block transition hover:opacity-95">
+        <Link to="/leads" className="block transition-transform duration-200 hover:-translate-y-0.5">
           <StatTile
             title={t("dashboard.openLeads")}
             value={leads.data?.length ?? "—"}
@@ -79,33 +79,51 @@ export function DashboardPage() {
         </Link>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <PageCard title={t("dashboard.recommended")}>
-          <QuickLink to="/members" label={t("members.add")} icon={<Users className="size-4" />} />
-          <QuickLink to="/checkin" label={t("checkin.submit")} icon={<ScanLine className="size-4" />} />
-          <QuickLink to="/billing" label={t("billing.pay")} icon={<Receipt className="size-4" />} />
-          <QuickLink to="/leads" label={t("leads.convert")} icon={<UserPlus className="size-4" />} />
+      <div className="grid gap-6 lg:grid-cols-2">
+        <PageCard
+          title={t("dashboard.recommended")}
+          action={
+            <Link to="/members" className="text-xs font-bold text-teal transition hover:underline">
+              {t("dashboard.viewMore")}
+            </Link>
+          }
+        >
+          <div className="space-y-2.5">
+            <QuickLink to="/members" label={t("members.add")} icon={<Users className="size-4 text-purple-700" />} pillBg="bg-purple-100/90" />
+            <QuickLink to="/checkin" label={t("checkin.submit")} icon={<ScanLine className="size-4 text-orange-700" />} pillBg="bg-orange-100/90" />
+            <QuickLink to="/billing" label={t("billing.pay")} icon={<Receipt className="size-4 text-teal-800" />} pillBg="bg-teal-100/90" />
+            <QuickLink to="/leads" label={t("leads.convert")} icon={<UserPlus className="size-4 text-blue-700" />} pillBg="bg-blue-100/90" />
+          </div>
         </PageCard>
 
-        <PageCard title={t("dashboard.appointments")}>
+        <PageCard
+          title={t("dashboard.appointments")}
+          action={
+            sessionItems.length > 0 ? (
+              <Link to="/classes" className="text-xs font-bold text-teal transition hover:underline">
+                {t("dashboard.viewMore")}
+              </Link>
+            ) : null
+          }
+        >
           {sessionItems.slice(0, 6).map((s, i) => {
             const row = asRecord(s);
             return (
-              <div key={i} className="mb-3 flex items-center gap-3 rounded-2xl bg-surface px-3 py-3 last:mb-0">
-                <div className="grid size-10 place-items-center rounded-2xl bg-lavender text-sm font-bold">
+              <div key={i} className="mb-3 flex items-center gap-3.5 rounded-2xl bg-surface/70 px-4 py-3 transition hover:bg-surface last:mb-0">
+                <div className="grid size-10 place-items-center rounded-2xl bg-purple-100/90 text-sm font-bold text-purple-800">
                   {String(str(row.name)).slice(0, 1)}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-semibold">{str(row.name)}</div>
-                  <div className="text-xs text-muted">{str(row.starts_at)}</div>
+                  <div className="truncate text-sm font-bold text-ink">{str(row.name)}</div>
+                  <div className="text-xs font-medium text-muted">{str(row.starts_at)}</div>
                 </div>
               </div>
             );
           })}
-          {sessionItems.length === 0 ? <p className="text-sm text-muted">{t("classes.empty")}</p> : null}
+          {sessionItems.length === 0 ? <p className="text-sm font-medium text-muted py-2">{t("classes.empty")}</p> : null}
           {sessionItems.length > 0 ? (
-            <Link to="/classes" className="mt-3 inline-block text-sm font-semibold text-teal">
-              {t("nav.classes")}
+            <Link to="/classes" className="mt-4 inline-block text-xs font-bold text-teal transition hover:underline">
+              {t("nav.classes")} &rarr;
             </Link>
           ) : null}
         </PageCard>
@@ -115,21 +133,21 @@ export function DashboardPage() {
         <PageCard
           title={t("dashboard.overdue")}
           action={
-            <Link to="/billing" className="text-sm font-semibold text-teal">
-              {t("nav.billing")}
+            <Link to="/billing" className="text-xs font-bold text-teal transition hover:underline">
+              {t("dashboard.viewMore")}
             </Link>
           }
         >
-          <div className="space-y-2">
+          <div className="space-y-2.5">
             {overdueItems.slice(0, 5).map((item, i) => {
               const row = asRecord(item);
               return (
                 <div
                   key={i}
-                  className="flex items-center justify-between rounded-2xl bg-peach/50 px-4 py-3 text-sm"
+                  className="flex items-center justify-between rounded-2xl bg-orange-50/70 border border-orange-100/50 px-4 py-3 text-sm"
                 >
-                  <span className="font-semibold">{str(row.id)}</span>
-                  <span>{money(Number(row.total_minor ?? row.remaining_minor ?? 0))}</span>
+                  <span className="font-semibold text-orange-950">{str(row.id)}</span>
+                  <span className="font-extrabold text-orange-950">{money(Number(row.total_minor ?? row.remaining_minor ?? 0))}</span>
                 </div>
               );
             })}
@@ -140,14 +158,25 @@ export function DashboardPage() {
   );
 }
 
-function QuickLink({ to, label, icon }: { to: string; label: string; icon: React.ReactNode }) {
+function QuickLink({
+  to,
+  label,
+  icon,
+  pillBg = "bg-surface",
+}: {
+  to: string;
+  label: string;
+  icon: React.ReactNode;
+  pillBg?: string;
+}) {
   return (
     <Link
       to={to}
-      className="mb-2 flex items-center gap-3 rounded-2xl bg-surface px-3 py-3 text-sm font-semibold text-ink transition hover:bg-lavender/60 last:mb-0"
+      className="flex items-center gap-3.5 rounded-2xl bg-surface/70 px-4 py-3 text-sm font-semibold text-ink transition-all hover:bg-white hover:shadow-xs"
     >
-      <span className="grid size-9 place-items-center rounded-xl bg-white">{icon}</span>
-      {label}
+      <span className={`grid size-9 place-items-center rounded-xl ${pillBg}`}>{icon}</span>
+      <span>{label}</span>
+      <span className="ml-auto text-xs text-muted font-bold">&rarr;</span>
     </Link>
   );
 }

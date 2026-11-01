@@ -71,7 +71,7 @@ export function MembersPage() {
   });
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <PageCard
         title={t("members.title")}
         action={
@@ -84,12 +84,12 @@ export function MembersPage() {
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder={t("members.search")}
-          className="mb-4 max-w-md"
+          className="mb-6 max-w-md"
         />
 
         {showForm ? (
           <form
-            className="mb-6 grid gap-3 rounded-[24px] bg-surface p-4 md:grid-cols-2"
+            className="mb-6 grid gap-4 rounded-[24px] bg-surface/60 border border-line/60 p-5 md:grid-cols-2"
             onSubmit={(e) => {
               e.preventDefault();
               create.mutate();
@@ -127,7 +127,7 @@ export function MembersPage() {
                 ))}
               </TextSelect>
             </Field>
-            <div className="md:col-span-2 flex gap-2">
+            <div className="md:col-span-2 flex gap-3 pt-2">
               <PrimaryButton type="submit" disabled={create.isPending}>
                 {t("members.save")}
               </PrimaryButton>
@@ -139,7 +139,7 @@ export function MembersPage() {
         ) : null}
 
         {(members.data ?? []).length === 0 ? (
-          <p className="text-sm text-muted">{t("members.empty")}</p>
+          <p className="text-sm font-medium text-muted py-4">{t("members.empty")}</p>
         ) : (
           <SoftTable
             headers={[t("members.name"), t("members.email"), t("members.status"), t("common.actions")]}
@@ -147,12 +147,12 @@ export function MembersPage() {
               const row = asRecord(m);
               const id = str(row.id, "");
               return [
-                str(row.name),
-                str(row.email),
-                <span key="s" className="rounded-full bg-mint px-2.5 py-1 text-xs font-semibold">
+                <span key="n" className="font-semibold text-ink">{str(row.name)}</span>,
+                <span key="e" className="text-muted">{str(row.email)}</span>,
+                <span key="s" className="inline-block rounded-full bg-emerald-100/90 text-emerald-800 px-3 py-1 text-xs font-bold">
                   {str(row.status, "active")}
                 </span>,
-                <GhostButton key="a" type="button" onClick={() => archive.mutate(id)}>
+                <GhostButton key="a" type="button" onClick={() => archive.mutate(id)} className="text-xs py-1.5 px-3">
                   {t("members.archive")}
                 </GhostButton>,
               ];

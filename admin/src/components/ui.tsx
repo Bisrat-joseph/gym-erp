@@ -13,11 +13,24 @@ export function PageCard({
   className?: string;
 }) {
   return (
-    <section className={cn("rounded-[28px] bg-white p-5 shadow-(--shadow-card)", className)}>
+    <section
+      className={cn(
+        "rounded-[24px] bg-white/95 dark:bg-[#151622]/95 backdrop-blur-md p-6 shadow-[0_12px_36px_-4px_rgba(26,27,47,0.06),0_4px_12px_-2px_rgba(26,27,47,0.03)] dark:shadow-[0_12px_36px_-4px_rgba(0,0,0,0.4)] ring-1 ring-black/[0.03] dark:ring-white/[0.06] transition-all hover:shadow-[0_16px_40px_-4px_rgba(26,27,47,0.08)] dark:hover:shadow-[0_16px_40px_-4px_rgba(0,0,0,0.5)]",
+        className,
+      )}
+    >
       {(title || action) && (
-        <div className="mb-4 flex items-center justify-between gap-3">
-          {title ? <h2 className="text-base font-bold text-ink">{title}</h2> : <div />}
-          {action}
+        <div className="mb-5 flex items-center justify-between gap-3">
+          {title ? (
+            <h2 className="text-base font-bold tracking-tight text-ink">{title}</h2>
+          ) : (
+            <div />
+          )}
+          {action && (
+            <div className="text-xs font-semibold text-teal hover:underline cursor-pointer">
+              {action}
+            </div>
+          )}
         </div>
       )}
       {children}
@@ -38,24 +51,33 @@ export function StatTile({
   icon: ReactNode;
   meta?: Array<{ icon: ReactNode; label: string }>;
 }) {
-  const bg =
-    tone === "lavender" ? "bg-lavender" : tone === "peach" ? "bg-peach" : "bg-mint";
+  const pillBg =
+    tone === "lavender"
+      ? "bg-purple-100/90 text-purple-700 dark:bg-purple-950/60 dark:text-purple-300"
+      : tone === "peach"
+        ? "bg-orange-100/90 text-orange-700 dark:bg-orange-950/60 dark:text-orange-300"
+        : "bg-teal-100/90 text-teal-800 dark:bg-teal-950/60 dark:text-teal-300";
+
   return (
-    <div className={cn("rounded-[28px] p-5 shadow-(--shadow-card)", bg)}>
-      <div className="mb-5 flex items-start justify-between gap-3">
-        <div className="grid size-12 place-items-center rounded-2xl bg-white/80 text-ink shadow-sm">
+    <div
+      className={cn(
+        "rounded-[24px] bg-white/95 dark:bg-[#151622]/95 backdrop-blur-md p-6 shadow-[0_12px_36px_-4px_rgba(26,27,47,0.06),0_4px_12px_-2px_rgba(26,27,47,0.03)] dark:shadow-[0_12px_36px_-4px_rgba(0,0,0,0.4)] ring-1 ring-black/[0.03] dark:ring-white/[0.06] transition-all duration-300 hover:shadow-[0_18px_44px_-4px_rgba(26,27,47,0.09)] dark:hover:shadow-[0_18px_44px_-4px_rgba(0,0,0,0.5)] hover:-translate-y-0.5",
+      )}
+    >
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div className={cn("grid size-12 place-items-center rounded-2xl shadow-xs transition-transform duration-200 group-hover:scale-105", pillBg)}>
           {icon}
         </div>
         <div className="text-right">
-          <div className="text-3xl font-bold tracking-tight text-ink">{value}</div>
-          <div className="mt-1 text-sm font-semibold text-ink/80">{title}</div>
+          <div className="text-3xl font-extrabold tracking-tight text-ink">{value}</div>
+          <div className="mt-1 text-xs font-medium text-muted">{title}</div>
         </div>
       </div>
       {meta && meta.length > 0 ? (
-        <div className="flex items-center gap-4 border-t border-white/50 pt-3">
+        <div className="flex items-center gap-4 border-t border-line/60 pt-3 mt-2">
           {meta.map((m, i) => (
             <div key={i} className="flex items-center gap-1.5 text-xs font-medium text-ink-soft">
-              <span className="grid size-7 place-items-center rounded-full bg-white/70">{m.icon}</span>
+              <span className="grid size-6 place-items-center rounded-full bg-surface text-ink-soft">{m.icon}</span>
               {m.label}
             </div>
           ))}
@@ -70,7 +92,7 @@ export function PrimaryButton(props: React.ButtonHTMLAttributes<HTMLButtonElemen
     <button
       {...props}
       className={cn(
-        "rounded-full bg-teal px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-teal/25 transition hover:bg-teal-dark disabled:opacity-50",
+        "rounded-full bg-teal px-6 py-2.5 text-sm font-bold text-white shadow-md shadow-teal/25 transition-all hover:bg-teal-dark hover:shadow-lg hover:shadow-teal/30 active:scale-95 disabled:opacity-50",
         props.className,
       )}
     />
@@ -82,7 +104,7 @@ export function GhostButton(props: React.ButtonHTMLAttributes<HTMLButtonElement>
     <button
       {...props}
       className={cn(
-        "rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:bg-surface disabled:opacity-50",
+        "rounded-full border border-line bg-white/80 dark:bg-white/5 px-4 py-2 text-sm font-semibold text-ink transition-all hover:bg-white dark:hover:bg-white/10 hover:shadow-xs disabled:opacity-50",
         props.className,
       )}
     />
@@ -98,7 +120,7 @@ export function Field({
 }) {
   return (
     <label className="block text-sm">
-      <span className="mb-1.5 block font-semibold text-ink-soft">{label}</span>
+      <span className="mb-1.5 block font-semibold text-ink-soft text-xs tracking-wide">{label}</span>
       {children}
     </label>
   );
@@ -109,7 +131,7 @@ export function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
     <input
       {...props}
       className={cn(
-        "w-full rounded-2xl border border-line bg-surface px-4 py-3 text-sm outline-none ring-teal/30 focus:bg-white focus:ring-2",
+        "w-full rounded-2xl border border-line bg-white/70 dark:bg-white/5 px-4 py-3 text-sm text-ink outline-none transition-all placeholder:text-muted ring-teal/30 focus:border-teal/40 focus:bg-white dark:focus:bg-white/10 focus:ring-2 focus:shadow-xs",
         props.className,
       )}
     />
@@ -121,7 +143,7 @@ export function TextSelect(props: React.SelectHTMLAttributes<HTMLSelectElement>)
     <select
       {...props}
       className={cn(
-        "w-full rounded-2xl border border-line bg-surface px-4 py-3 text-sm outline-none ring-teal/30 focus:bg-white focus:ring-2",
+        "w-full rounded-2xl border border-line bg-white/70 dark:bg-[#181926] px-4 py-3 text-sm text-ink outline-none transition-all ring-teal/30 focus:border-teal/40 focus:bg-white dark:focus:bg-[#1f2030] focus:ring-2 focus:shadow-xs",
         props.className,
       )}
     />
@@ -139,9 +161,9 @@ export function SoftTable({
     <div className="overflow-x-auto">
       <table className="w-full min-w-[640px] border-separate border-spacing-y-2 text-left text-sm">
         <thead>
-          <tr className="text-xs font-semibold tracking-wide text-muted uppercase">
+          <tr className="text-xs font-semibold tracking-wider text-muted uppercase">
             {headers.map((h) => (
-              <th key={h} className="px-3 py-1 font-semibold">
+              <th key={h} className="px-4 py-2 font-semibold">
                 {h}
               </th>
             ))}
@@ -149,9 +171,9 @@ export function SoftTable({
         </thead>
         <tbody>
           {rows.map((row, i) => (
-            <tr key={i} className="bg-surface/80">
+            <tr key={i} className="bg-surface/60 dark:bg-white/[0.03] transition-colors hover:bg-surface/90 dark:hover:bg-white/[0.06]">
               {row.map((cell, j) => (
-                <td key={j} className="px-3 py-3 first:rounded-l-2xl last:rounded-r-2xl">
+                <td key={j} className="px-4 py-3.5 first:rounded-l-2xl last:rounded-r-2xl">
                   {cell}
                 </td>
               ))}
